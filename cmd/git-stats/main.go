@@ -104,7 +104,7 @@ func run(args []string) error {
 	case "rebuild":
 		return runRebuild(args[1:])
 	case "version", "-version", "--version":
-		fmt.Println("git-stats", version.Version)
+		fmt.Println("git-stats", version.String())
 		return nil
 	case "help", "-h", "--help":
 		usage()
