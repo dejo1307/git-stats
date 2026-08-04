@@ -27,8 +27,14 @@ func HTMLFile(path string, db *store.DB, opts Options) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	return dashboardTmpl.Execute(f, data)
+	// Close is reported, not deferred away: a write error commonly surfaces
+	// only on close, and swallowing it would report success for a dashboard
+	// that is silently truncated.
+	if err := dashboardTmpl.Execute(f, data); err != nil {
+		f.Close() //nolint:errcheck // the execute error is the one worth reporting
+		return err
+	}
+	return f.Close()
 }
 
 // tile is one headline number.

@@ -46,7 +46,7 @@ func Load() (Loaded, error) {
 		if err != nil {
 			return Loaded{}, err
 		}
-		defer f.Close()
+		defer f.Close() //nolint:errcheck // read-only; the values are already parsed
 
 		vars, err := Parse(f)
 		if err != nil {

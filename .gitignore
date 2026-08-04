@@ -18,6 +18,12 @@ data/stats.db-shm
 # Generated dashboards.
 *.html
 
-# Build artifacts.
+# Build artifacts. Leading slash on /git-stats is deliberate: an unanchored
+# `git-stats` would also match the cmd/git-stats/ DIRECTORY, silently hiding
+# every source file added there.
 bin/
+dist/
 /git-stats
+
+# enola's snapshot and pinned baseline — derived, and re-indexed on every run.
+.enola/

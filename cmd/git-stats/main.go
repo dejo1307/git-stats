@@ -24,6 +24,7 @@ import (
 	"github.com/dejo1307/git-stats/internal/github"
 	"github.com/dejo1307/git-stats/internal/report"
 	"github.com/dejo1307/git-stats/internal/store"
+	"github.com/dejo1307/git-stats/internal/version"
 )
 
 // Environment variables, all of which may equally come from a .env file.
@@ -54,6 +55,7 @@ usage:
   git-stats report  [-repo R] [-since 30d] [-per-day] [-html FILE]
   git-stats rebuild [-repo R] [-data DIR]
   git-stats backfill-stars [-repo R] [-data DIR]
+  git-stats version
 
 commands:
   collect         snapshot every available endpoint into the archive and database
@@ -101,6 +103,9 @@ func run(args []string) error {
 		return runReport(args[1:])
 	case "rebuild":
 		return runRebuild(args[1:])
+	case "version", "-version", "--version":
+		fmt.Println("git-stats", version.Version)
+		return nil
 	case "help", "-h", "--help":
 		usage()
 		return nil
