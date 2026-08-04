@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test -race -count=1 ./...
+
+  # Every platform is cross-compiled from ONE Linux runner.
+  #
+  # This is possible because git-stats has no cgo dependency — modernc.org/sqlite
+  # is a pure-Go SQLite — so `CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build`
+  # produces a real Intel Mach-O binary without an Intel machine.
+  #
+  # That matters: macos-13 is GitHub's last Intel macOS runner and it is being
+  # retired. A matrix that builds darwin/amd64 on a native Intel runner stops
+  # producing Intel Mac binaries the day that image goes away, and Intel Mac users
+  # silently lose their download. Cross-compiling has no such dependency.
+  #
+  # Building all targets in a single job also makes the release atomic: either
+  # every asset uploads or none does, instead of a matrix leg failing and
+  # publishing a release that is missing one platform.
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Compute version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build every platform
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 \
+                        windows/amd64 windows/arm64; do
+            goos=${target%/*}
+            goarch=${target#*/}
+            base="git-stats-${VERSION}-${goos}-${goarch}"
+            ext=""
+            [ "$goos" = "windows" ] && ext=".exe"
+
+            echo "==> $target"
+            GOOS=$goos GOARCH=$goarch go build \
+              -trimpath \
+              -ldflags "-s -w -X github.com/dejo1307/git-stats/internal/version.Version=${VERSION}" \
+              -o "dist/${base}${ext}" \
+              ./cmd/git-stats
+          done
+
+      # Guards the reason this job cross-compiles at all: assert each binary is
+      # actually the architecture its filename claims. A silent fallback to the
+      # host arch would otherwise ship an arm64 binary named "darwin-amd64" and
+      # break exactly the Intel Mac users this is meant to protect.
+      - name: Verify architectures
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          check() {
+            file -b "dist/git-stats-${VERSION}-$1" | tee /dev/stderr | grep -q "$2" \
+              || { echo "FAIL: $1 is not $2" >&2; exit 1; }
+          }
+          check linux-amd64     "ELF 64-bit.*x86-64"
+          check linux-arm64     "ELF 64-bit.*aarch64"
+          check darwin-amd64    "Mach-O 64-bit.*x86_64"
+          check darwin-arm64    "Mach-O 64-bit.*arm64"
+          check windows-amd64.exe "PE32+.*x86-64"
+          check windows-arm64.exe "PE32+.*Aarch64"
+
+      # Asset names follow <prefix>-<version>-<goos>-<goarch>.<ext>, which is the
+      # scheme git-stats itself parses — so git-stats can track its own releases
+      # with no GIT_STATS_ASSET_PREFIX set.
+      - name: Package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in git-stats-"${VERSION}"-*; do
+            case "$f" in *.tar.gz|*.sha256) continue ;; esac
+            base="${f%.exe}"
+            tar czf "${base}.tar.gz" "$f"
+            sha256sum "${base}.tar.gz" > "${base}.sha256"
+            rm "$f"
+          done
+          ls -l
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256

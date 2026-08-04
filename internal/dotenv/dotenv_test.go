@@ -84,7 +84,9 @@ func TestLoadDoesNotOverrideRealEnvironment(t *testing.T) {
 	if loaded.Supplied("ALREADY_SET") {
 		t.Error("Supplied(ALREADY_SET) = true, but the environment provided that value")
 	}
-	os.Unsetenv("FROM_FILE")
+	// Setenv registers its own cleanup, so the variable this test leaked into
+	// the process is unset when it ends.
+	t.Setenv("FROM_FILE", "")
 }
 
 func TestLoadWithoutFileIsNotAnError(t *testing.T) {
@@ -108,12 +110,7 @@ func writeEnv(t *testing.T, dir, body string) {
 
 func chdir(t *testing.T, dir string) {
 	t.Helper()
-	prev, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chdir(dir); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.Chdir(prev) })
+	// t.Chdir restores the previous directory itself and fails the test if
+	// either move fails.
+	t.Chdir(dir)
 }

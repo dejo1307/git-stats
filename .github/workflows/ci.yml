@@ -1,0 +1,183 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests with coverage
+        run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Coverage summary
+        run: |
+          echo '### Coverage' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          go tool cover -func=coverage.out | tail -1 >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  # The same cross-compile the release performs, run on every PR.
+  #
+  # Without this, a change that quietly introduces a cgo dependency still passes
+  # CI and only fails at tag time — or worse, succeeds on the Linux runner and
+  # produces a broken Intel Mac binary. Catching it here keeps every tag
+  # releasable.
+  cross-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build every release target
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 \
+                        windows/amd64 windows/arm64; do
+            goos=${target%/*}
+            goarch=${target#*/}
+            echo "==> $target"
+            GOOS=$goos GOARCH=$goarch go build -trimpath -o /dev/null ./cmd/git-stats
+          done
+
+  # golangci-lint v2 (action @v8). The repo baseline is clean, so this gates the
+  # whole tree — any new finding fails the build. Linter set in .golangci.yml.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        run: govulncheck ./...
+
+  # Architectural regression gate, powered by enola (github.com/enola-labs/enola).
+  #
+  # ADVISORY — this job reports the verdict and always succeeds. To make it
+  # enforcing, delete the `exit 0` at the end of "Grade the change"; the exit code
+  # is already the verdict.
+  #
+  # The baseline comes from the PR's own merge base rather than a published
+  # artifact. That costs one extra index — for this repo about 17ms — and needs no
+  # cross-workflow artifact plumbing.
+  architecture:
+    # Only PRs have a merge base to grade against.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # merge-base needs history; the default depth-1 clone has none
+
+      # One binary for both snapshots, so the enola version and config hash are
+      # identical on the two sides — otherwise the gate would (correctly) decline
+      # to grade.
+      - name: Install enola
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/enola-labs/enola/main/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Pin a baseline from the merge base
+        run: |
+          set -euo pipefail
+          # Be explicit about fetching the base branch: actions/checkout leaves a PR
+          # on a merge ref, and origin/<base> is not guaranteed to be present.
+          git fetch --no-tags --quiet origin \
+            "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+
+          # Record the head as an explicit SHA: `git checkout -` is unreliable after
+          # a --detach, and returning to the wrong commit would grade the base
+          # against itself and always report clean.
+          head=$(git rev-parse HEAD)
+          base=$(git merge-base "$head" "origin/${{ github.base_ref }}")
+          echo "Baseline: $base"
+          echo "PR head:  $head"
+
+          git checkout --quiet --detach "$base"
+          enola baseline pin
+          # .enola/ is gitignored, so the pinned baseline survives the checkout back.
+          git checkout --quiet --detach "$head"
+
+      - name: Grade the change
+        run: |
+          # Run without --warn-only so the verdict text stays honest about what the
+          # policy WOULD do; the job's advisory status comes from the exit 0 below.
+          set +e
+          enola check 2>/dev/null | tee verdict.txt
+          code=${PIPESTATUS[0]}
+          set -e
+
+          {
+            echo '### Architecture'
+            case "$code" in
+              0) echo 'No structural regression.' ;;
+              1) echo '**Structural regression introduced** — advisory for now, see the verdict below.' ;;
+              2) echo 'The gate could not run (exit 2).' ;;
+              3) echo 'Declined to grade: the baseline was not comparable (exit 3). Not a statement about this change.' ;;
+              *) echo "Unexpected exit $code." ;;
+            esac
+            echo '```'
+            cat verdict.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Advisory: report, never block. Delete this line to make the gate
+          # enforcing — the exit code above is already the verdict.
+          exit 0
+
+      - name: Upload the verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: architecture-verdict
+          path: verdict.txt
+          if-no-files-found: ignore

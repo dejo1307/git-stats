@@ -1,0 +1,53 @@
+# golangci-lint v2 config. High-signal linter set; the repo baseline is clean,
+# so CI gates the whole tree (see .github/workflows/ci.yml).
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+  settings:
+    errcheck:
+      # Cleanup and reporting calls whose error is genuinely unactionable.
+      #
+      # Every entry is either a reader being released (the data is already
+      # decoded, and a failed close changes nothing) or a write to a report
+      # stream (a half-written summary is visible on screen; returning an error
+      # from the middle of one only loses the rest of it).
+      #
+      # A write path whose error DOES matter is not listed here and must be
+      # checked — see HTMLFile in internal/report/html.go, where a failed close
+      # means a truncated dashboard reported as success.
+      exclude-functions:
+        - (*database/sql.Rows).Close
+        - (*database/sql.Stmt).Close
+        - (*database/sql.DB).Close
+        - (io.Closer).Close
+        - (*text/tabwriter.Writer).Flush
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+    staticcheck:
+      # "all" minus the checks golangci-lint disables by default (ST1000/3/16/20/21/22),
+      # minus QF1012: it rewrites the readable `sb.WriteString(fmt.Sprintf(...))` idiom
+      # to `fmt.Fprintf(&sb, ...)` repo-wide for no real benefit. Every bug-class (SA*)
+      # and simplification (S1*) check stays on.
+      checks:
+        - "all"
+        - "-ST1000"
+        - "-ST1003"
+        - "-ST1016"
+        - "-ST1020"
+        - "-ST1021"
+        - "-ST1022"
+        - "-QF1012"
+
+issues:
+  # Show every finding (defaults cap duplicates at 3, which hides repeated
+  # issues like multiple unchecked f.Close calls).
+  max-issues-per-linter: 0
+  max-same-issues: 0

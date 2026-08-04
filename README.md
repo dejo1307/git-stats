@@ -109,6 +109,7 @@ git-stats collect [-repo R] [-data DIR] [-stars]
 git-stats report  [-repo R] [-since 30d] [-per-day] [-html FILE]
 git-stats rebuild [-repo R] [-data DIR]
 git-stats backfill-stars [-repo R] [-data DIR]
+git-stats version
 ```
 
 - `report -html stats.html` writes a self-contained dashboard — no external requests,
@@ -254,6 +255,39 @@ Collection is manual by design. If you want it automatic, a launchd agent or a s
 timer calling `collect` once a day is enough — and unlike cron, launchd fires on wake if
 the machine was asleep at the scheduled time. Until then: any traffic day not captured
 within 14 days is lost, while release download counts are cumulative and never lost.
+
+## Releases and CI
+
+Tagging `v*` builds and publishes every platform:
+
+| | amd64 | arm64 |
+|---|---|---|
+| Linux | ✓ | ✓ |
+| macOS | ✓ (Intel) | ✓ (Apple Silicon) |
+| Windows | ✓ | ✓ |
+
+All six are **cross-compiled from a single Linux runner** with `CGO_ENABLED=0`,
+which is possible because the only heavyweight dependency — `modernc.org/sqlite` —
+is a pure-Go SQLite.
+
+That is a deliberate choice rather than a convenience. `macos-13` is GitHub's last
+Intel macOS runner and it is being retired; any release workflow that builds
+darwin/amd64 on a native Intel runner stops producing Intel Mac binaries the day
+that image disappears, and Intel users silently lose their download. Cross-compiling
+has no such dependency, and the release job asserts each binary's actual
+architecture with `file` before publishing, so a silent fallback to the host
+architecture fails the build instead of shipping a mislabelled binary.
+
+Release assets follow the same `<prefix>-<version>-<os>-<arch>.<ext>` scheme
+git-stats parses, so it can track its own releases with no configuration.
+
+CI on every pull request runs tests with the race detector, the same six-target
+cross-build, `golangci-lint`, `govulncheck`, and an architectural regression gate
+powered by [enola](https://github.com/enola-labs/enola) — which pins a baseline
+from the PR's merge base and grades what the change did to the structure. The
+architecture job is **advisory**: it reports a verdict into the job summary and
+never blocks. To make it enforcing, delete the `exit 0` at the end of its "Grade
+the change" step.
 
 ## License
 
