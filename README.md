@@ -16,16 +16,35 @@ So this tool snapshots those endpoints, archives every raw response, and derives
 trends from the archive. Everything stays on your machine — there is no service,
 no account and no telemetry.
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dejo1307/git-stats/main/install.sh | sh
+```
+
+Installs the latest release into `$HOME/.local/bin`, verifying the published
+SHA-256 checksum before it does. Set `GIT_STATS_INSTALL_DIR` to install elsewhere,
+or `GIT_STATS_VERSION` to pin a version. Linux, macOS (Intel and Apple Silicon) and
+Windows via Git Bash / MSYS2 are all covered.
+
+Prefer to build it yourself, or want a platform the releases don't cover:
+
+```sh
+go install github.com/dejo1307/git-stats/cmd/git-stats@latest
+```
+
+Binaries for every platform are also attached to each
+[release](https://github.com/dejo1307/git-stats/releases) as
+`git-stats-<version>-<os>-<arch>.tar.gz`, each with a `.sha256` beside it.
+
 ## Quick start
 
 ```sh
-go build -o bin/git-stats ./cmd/git-stats
-
 cp .env.example .env && chmod 600 .env
-$EDITOR .env                   # set GIT_STATS_REPO=owner/name
+$EDITOR .env             # set GIT_STATS_REPO=owner/name
 
-./bin/git-stats collect        # take a snapshot
-./bin/git-stats report         # see where things stand
+git-stats collect        # take a snapshot
+git-stats report         # see where things stand
 ```
 
 `collect` works with no token at all for release counters. To get traffic data you
@@ -279,7 +298,15 @@ architecture with `file` before publishing, so a silent fallback to the host
 architecture fails the build instead of shipping a mislabelled binary.
 
 Release assets follow the same `<prefix>-<version>-<os>-<arch>.<ext>` scheme
-git-stats parses, so it can track its own releases with no configuration.
+git-stats parses, so it can track its own releases with no configuration. And
+because [install.sh](install.sh) fetches each artifact's `.sha256` alongside it,
+git-stats' own "scripted installs" figure means what it claims to.
+
+[install.sh](install.sh) is POSIX `sh`, deliberately — no bashisms and no
+`set -o pipefail`. A piped script never honours its own shebang; the interpreter
+on the left of the pipe runs it, and on Debian and Ubuntu that is dash, which
+rejects `pipefail` outright. A bash-only installer dies on `| sh` before it does
+any real work, on the most common Linux systems there are.
 
 CI on every pull request runs tests with the race detector, the same six-target
 cross-build, `golangci-lint`, `govulncheck`, and an architectural regression gate
