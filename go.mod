@@ -1,6 +1,6 @@
 module github.com/dejo1307/git-stats
 
-go 1.25.0
+go 1.25.12
 
 require modernc.org/sqlite v1.56.0
 

@@ -121,9 +121,13 @@ jobs:
       # One binary for both snapshots, so the enola version and config hash are
       # identical on the two sides — otherwise the gate would (correctly) decline
       # to grade.
+      # Piped to bash, not sh. install.sh declares `#!/usr/bin/env bash` and uses
+      # `set -o pipefail`, but a piped script never gets to honour its shebang —
+      # the interpreter on the left of the pipe wins. On Ubuntu /bin/sh is dash,
+      # which has no pipefail, so `| sh` dies with "Illegal option -o pipefail".
       - name: Install enola
         run: |
-          curl -fsSL https://raw.githubusercontent.com/enola-labs/enola/main/install.sh | sh
+          curl -fsSL https://raw.githubusercontent.com/enola-labs/enola/main/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Pin a baseline from the merge base
