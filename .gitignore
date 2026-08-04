@@ -1,0 +1,23 @@
+# Holds the API token and the repository to track — never commit.
+.env
+
+# Derived from data/raw/ — always reproducible with `git-stats rebuild`.
+data/stats.db
+data/stats.db-wal
+data/stats.db-shm
+
+# data/raw/ is deliberately NOT ignored. GitHub deletes traffic data after 14
+# days, so those files are the only copy that will ever exist — committing them
+# is the backup. They compress ~95% (consecutive releases.json are near
+# identical), which projects to roughly 15 MB per year of daily collection.
+#
+# WARNING before committing an archive to a PUBLIC repository: views, clones,
+# referrers and paths are owner-only analytics, and committing them publishes
+# them. Add `data/` here if you would rather keep them private.
+
+# Generated dashboards.
+*.html
+
+# Build artifacts.
+bin/
+/git-stats
