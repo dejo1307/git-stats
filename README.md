@@ -16,6 +16,22 @@ So this tool snapshots those endpoints, archives every raw response, and derives
 trends from the archive. Everything stays on your machine — there is no service,
 no account and no telemetry.
 
+## What it looks like
+
+One command takes a snapshot, the other says where things stand:
+
+![git-stats collect, then git-stats report](docs/demo.gif)
+
+`report -html` writes the same numbers as a self-contained dashboard — one file,
+no external requests, opens straight from disk:
+
+![the HTML dashboard, scrolled top to bottom](docs/dashboard.gif)
+
+Both recordings run against a synthetic dataset: `acme/widget` is not a real
+repository, and none of those figures are anybody's real traffic. Views, clones,
+referrers and paths are owner-only analytics, so a README is the wrong place for
+a real one.
+
 ## Install
 
 ```sh
@@ -63,6 +79,7 @@ variables always win** — `.env` supplies defaults only, so a one-off
 | `GIT_STATS_TOKEN` | API token. Falls back to `GH_TOKEN`, then `GITHUB_TOKEN`. |
 | `GIT_STATS_ASSET_PREFIX` | Release asset filename prefix. Defaults to the repository name. |
 | `GIT_STATS_DIR` | Data directory holding `raw/` and `stats.db`. Defaults to `./data`. |
+| `GIT_STATS_API_BASE` | API host. Defaults to `https://api.github.com`; set it to `https://HOST/api/v3` for GitHub Enterprise Server. |
 
 There is deliberately no default repository: an unset `GIT_STATS_REPO` is an error
 rather than a silent fallback, so a misconfigured run cannot quietly archive
@@ -154,15 +171,17 @@ Both `collect` and `rebuild` write to the database through the same ingest path,
 rebuild reproduces exactly what collection produced. The database is safe to delete;
 the archive is not. A file is simply absent when that endpoint was unavailable.
 
-**`data/raw/` is not gitignored, on purpose; `data/stats.db` is.** GitHub deletes
-traffic data after 14 days, so those files become the only copy that will ever exist —
-version control is the backup. The archive compresses about 95% (consecutive
-`releases.json` are nearly identical), which works out to roughly 15 MB per year of
-daily collection.
+**Committing `data/raw/` is worth considering.** GitHub deletes traffic data after 14
+days, so those files become the only copy that will ever exist — version control is the
+backup. The archive compresses about 95% (consecutive `releases.json` are nearly
+identical), which works out to roughly 15 MB per year of daily collection. `stats.db` is
+derived and never needs committing.
 
-> **Before pushing an archive to a public repository:** views, clones, referrers and
-> paths are owner-only analytics, and committing them publishes them. Add `data/` to
-> `.gitignore` if you would rather keep them private.
+> **Only in a private repository, though:** views, clones, referrers and paths are
+> owner-only analytics of whatever you are tracking, and committing them publishes them.
+> This repository ignores its own `/data/` for exactly that reason — it is public, so
+> the numbers in the gifs above come from a synthetic dataset rather than a real
+> archive.
 
 ## Querying it directly
 

@@ -1,22 +1,31 @@
 # Holds the API token and the repository to track — never commit.
 .env
 
-# Derived from data/raw/ — always reproducible with `git-stats rebuild`.
-data/stats.db
-data/stats.db-wal
-data/stats.db-shm
-
-# data/raw/ is deliberately NOT ignored. GitHub deletes traffic data after 14
-# days, so those files are the only copy that will ever exist — committing them
-# is the backup. They compress ~95% (consecutive releases.json are near
-# identical), which projects to roughly 15 MB per year of daily collection.
+# This repository's own collection output. Views, clones, referrers and paths
+# are owner-only analytics of whatever repository is being tracked, and this
+# repository is public — committing an archive here would publish them.
 #
-# WARNING before committing an archive to a PUBLIC repository: views, clones,
-# referrers and paths are owner-only analytics, and committing them publishes
-# them. Add `data/` here if you would rather keep them private.
+# The leading slash is deliberate: an unanchored `data/` would also match
+# docs/demo/data/, which holds the synthetic dataset the README gifs are
+# recorded from and IS committed.
+#
+# Committing data/raw/ is still the right default for a PRIVATE tracking repo:
+# GitHub deletes traffic data after 14 days, so the archive becomes the only
+# copy that will ever exist, and version control is the backup.
+/data/
 
 # Generated dashboards.
 *.html
+
+# docs/ ships the two recordings the README embeds and nothing else. The
+# fixtures they are made from, the VHS tape, the capture scripts and the build
+# scratch all stay local — they are how the gifs get made, not what the project
+# is. Ignoring the directory and re-including the gifs is deliberate: git does
+# not descend into an ignored directory, so a negation can only rescue paths
+# whose parents are still visible, which is why this ignores docs/* rather
+# than docs/.
+/docs/*
+!/docs/*.gif
 
 # Build artifacts. Leading slash on /git-stats is deliberate: an unanchored
 # `git-stats` would also match the cmd/git-stats/ DIRECTORY, silently hiding
