@@ -38,6 +38,11 @@ const (
 	envAssetPrefix = "GIT_STATS_ASSET_PREFIX"
 	// envDir overrides the default data directory.
 	envDir = "GIT_STATS_DIR"
+	// envAPIBase overrides the API host. It exists for GitHub Enterprise
+	// Server, whose REST API lives under https://HOST/api/v3, and for
+	// pointing a run at a local fixture server, which is how the recordings
+	// in the README are made.
+	envAPIBase = "GIT_STATS_API_BASE"
 )
 
 func main() {
@@ -72,6 +77,8 @@ environment:
                           breakdown of <prefix>-<version>-<os>-<arch>.<ext>.
                           Defaults to the repository name.
   GIT_STATS_DIR           default data directory (otherwise ./data)
+  GIT_STATS_API_BASE      API host (otherwise https://api.github.com). Point it at
+                          https://HOST/api/v3 for GitHub Enterprise Server.
 
 All of these may instead be set in a .env file, read from the working directory or
 from the directory holding the binary. Exported variables take precedence over it.
@@ -175,8 +182,12 @@ func runCollect(ctx context.Context, args []string, forceStars bool, env dotenv.
 		Token:   token,
 		DataDir: *data,
 		Assets:  assetNamer(repo),
+		APIBase: strings.TrimRight(strings.TrimSpace(os.Getenv(envAPIBase)), "/"),
 		Stars:   *stars || forceStars,
 		Log:     os.Stdout,
+	}
+	if cfg.APIBase != "" {
+		fmt.Printf("api: %s\n", cfg.APIBase)
 	}
 
 	// Name the credential's origin: a 403 on the traffic endpoints is almost
