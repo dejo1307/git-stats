@@ -29,6 +29,16 @@ type Config struct {
 	// Stars additionally backfills the full stargazer history, which is a
 	// paginated crawl and so is off by default.
 	Stars bool
+	// Forks additionally backfills the full fork history. Like Stars it is a
+	// paginated crawl over a list that dates itself, so one run is complete.
+	Forks bool
+	// TrackPaths are repository paths whose commit history is captured, to date
+	// the changes a reader would have noticed — README.md above all. One cheap
+	// request each, so this runs on every collection.
+	TrackPaths []string
+	// CommitDetails additionally fetches each tracked commit's diff size, which
+	// costs one request per commit and is cached permanently.
+	CommitDetails bool
 	// Log receives progress and warnings.
 	Log io.Writer
 }
@@ -39,6 +49,10 @@ type Result struct {
 	Releases int
 	Assets   int
 	Total    int64
+	// Commits counts commits captured across every tracked path.
+	Commits int
+	// Details counts per-commit diff sizes newly fetched this run.
+	Details int
 	// TrafficSkipped is set when the traffic endpoints were unavailable,
 	// which is the expected outcome for anything but a classic token.
 	TrafficSkipped bool
@@ -168,6 +182,28 @@ func fetch(ctx context.Context, cfg Config, client *github.Client, snap store.Sn
 		logf(cfg, "traffic: views, clones, paths and referrers captured\n")
 	}
 
+	if err := fetchTracked(ctx, cfg, client, snap, res); err != nil {
+		return err
+	}
+
+	if cfg.Forks {
+		forks, raw, err := client.Forks(ctx)
+		switch {
+		case github.IsForbidden(err):
+			logf(cfg, "WARNING: fork history unavailable — the forks endpoint rejected "+
+				"this credential.\n"+
+				"         Fork counts are still tracked per snapshot from the repository "+
+				"endpoint.\n")
+		case err != nil:
+			return fmt.Errorf("fetching forks: %w", err)
+		default:
+			if err := snap.Write(store.FileForks, raw); err != nil {
+				return err
+			}
+			logf(cfg, "forks: %d forks with timestamps\n", len(forks))
+		}
+	}
+
 	if cfg.Stars {
 		stars, raw, err := client.Stargazers(ctx)
 		switch {
@@ -190,6 +226,57 @@ func fetch(ctx context.Context, cfg Config, client *github.Client, snap store.Sn
 		}
 	}
 
+	return nil
+}
+
+// fetchTracked captures the commit history of every tracked path.
+//
+// This is the one series here that is both complete and cheap: GitHub imposes
+// no retention on commit history, so a single request per path reaches back to
+// the repository's first commit, and re-running it costs the same request
+// again. That makes README changes datable retroactively, unlike traffic.
+func fetchTracked(ctx context.Context, cfg Config, client *github.Client,
+	snap store.Snapshot, res *Result) error {
+	for _, path := range cfg.TrackPaths {
+		commits, raw, err := client.CommitsForPath(ctx, path)
+		if github.IsForbidden(err) {
+			logf(cfg, "WARNING: no commit history for %s — the endpoint rejected this "+
+				"credential or the path does not exist.\n", path)
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("fetching commits for %s: %w", path, err)
+		}
+		if err := snap.Write(store.CommitsFile(path), raw); err != nil {
+			return err
+		}
+		res.Commits += len(commits)
+		logf(cfg, "tracked: %s changed in %d commit(s)\n", path, len(commits))
+
+		if !cfg.CommitDetails {
+			continue
+		}
+		// A commit is immutable, so a cached detail is never refetched. Only
+		// the first backfill pays the per-commit request.
+		for _, c := range commits {
+			if _, found, err := snap.ReadCommitDetail(c.SHA); err != nil {
+				return err
+			} else if found {
+				continue
+			}
+			_, detailRaw, err := client.CommitDetail(ctx, c.SHA)
+			if err != nil {
+				return fmt.Errorf("fetching commit %s: %w", c.SHA, err)
+			}
+			if err := snap.WriteCommitDetail(c.SHA, detailRaw); err != nil {
+				return err
+			}
+			res.Details++
+		}
+	}
+	if res.Details > 0 {
+		logf(cfg, "tracked: fetched %d new commit diff size(s)\n", res.Details)
+	}
 	return nil
 }
 

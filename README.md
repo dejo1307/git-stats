@@ -69,8 +69,8 @@ need a credential — see below.
 ## Configuration
 
 Everything is configured through environment variables, which may equally live in a
-`.env` file next to the binary or in the working directory. **Real environment
-variables always win** — `.env` supplies defaults only, so a one-off
+`.env` file next to the binary, in the working directory, or wherever `-env` points.
+**Real environment variables always win** — `.env` supplies defaults only, so a one-off
 `GIT_STATS_REPO=other/repo git-stats collect` still overrides the file.
 
 | Variable | Meaning |
@@ -78,12 +78,55 @@ variables always win** — `.env` supplies defaults only, so a one-off
 | `GIT_STATS_REPO` | **Required.** Repository to track, as `owner/name`. `-repo` overrides it. |
 | `GIT_STATS_TOKEN` | API token. Falls back to `GH_TOKEN`, then `GITHUB_TOKEN`. |
 | `GIT_STATS_ASSET_PREFIX` | Release asset filename prefix. Defaults to the repository name. |
+| `GIT_STATS_TRACK_PATHS` | Comma-separated paths whose commit history is captured, so changes to them can be lined up against the numbers. Defaults to `README.md`; a trailing slash tracks a directory. |
 | `GIT_STATS_DIR` | Data directory holding `raw/` and `stats.db`. Defaults to `./data`. |
 | `GIT_STATS_API_BASE` | API host. Defaults to `https://api.github.com`; set it to `https://HOST/api/v3` for GitHub Enterprise Server. |
 
 There is deliberately no default repository: an unset `GIT_STATS_REPO` is an error
 rather than a silent fallback, so a misconfigured run cannot quietly archive
 somebody else's numbers.
+
+### Tracking several repositories
+
+One binary, one configuration file per repository, each naming its own data
+directory. `-env` selects which:
+
+```
+~/stats/
+  acme-widget.env      GIT_STATS_REPO=acme/widget
+                       GIT_STATS_DIR=/Users/me/stats/acme-widget
+                       GIT_STATS_TOKEN=…
+  acme-gadget.env      GIT_STATS_REPO=acme/gadget
+                       GIT_STATS_DIR=/Users/me/stats/acme-gadget
+                       GIT_STATS_TOKEN=…
+  acme-widget/         raw/  stats.db
+  acme-gadget/         raw/  stats.db
+```
+
+```sh
+git-stats collect -env ~/stats/acme-widget.env
+git-stats collect -env ~/stats/acme-gadget.env
+git-stats report  -env ~/stats/acme-gadget.env -html gadget.html
+```
+
+`-env` works on every command and is read before anything else, since it is what
+supplies the defaults every other flag falls back to. Flags still override it, so
+`-data` or `-repo` can redirect a single run without editing the file.
+
+**Set `GIT_STATS_DIR` in every one of them.** It is the only thing keeping two
+repositories in two archives. Without it both runs default to `./data` relative to
+wherever you are standing, and one snapshot series ends up holding one repository's
+releases beside another's traffic — a mixture no `rebuild` can take apart afterwards,
+because the archive it replays is already wrong. `collect` warns when `-env` is used
+and no data directory is configured.
+
+Two smaller guarantees in the same spirit: a `-env` file that does not exist is an
+error rather than a quiet fall back to whichever `.env` is nearby, and the token is
+resolved per file, so each repository can carry a credential scoped to itself.
+
+Nothing about a data directory is tied to a checkout of this repository — it is just
+`raw/` and `stats.db`. Keeping the archives somewhere central, as above, tends to age
+better than one `data/` per project clone.
 
 ### Release asset names
 
@@ -141,20 +184,27 @@ and can be caught up at any time; traffic cannot.
 ## Commands
 
 ```
-git-stats collect [-repo R] [-data DIR] [-stars]
+git-stats collect [-repo R] [-data DIR] [-stars] [-forks] [-track PATHS]
 git-stats report  [-repo R] [-since 30d] [-per-day] [-html FILE]
 git-stats rebuild [-repo R] [-data DIR]
+git-stats backfill [-repo R] [-data DIR]
 git-stats backfill-stars [-repo R] [-data DIR]
 git-stats version
 ```
+
+Every command also takes `-env FILE` to read configuration from a named file — see
+[Tracking several repositories](#tracking-several-repositories).
 
 - `report -html stats.html` writes a self-contained dashboard — no external requests,
   works opened straight from disk, light and dark.
 - `rebuild` deletes the database and replays the whole archive into a new one. It
   takes `-repo` even though it fetches nothing, because replaying re-derives the
   per-platform columns from asset filenames.
-- `backfill-stars` fetches the full star history; each star carries its own timestamp,
-  so unlike everything else here it is retroactively complete rather than sampled.
+- `backfill` fetches every history that dates itself: stars, forks, and the diff size of
+  each commit touching a tracked path. All three are complete back to the first commit,
+  so this is worth running once rather than repeatedly — the per-commit half is cached
+  permanently, since a commit cannot change.
+- `backfill-stars` is the star history on its own.
 
 ## Data layout
 
@@ -164,8 +214,16 @@ git-stats version
 data/
   raw/2026-08-04T07-02-47Z/    immutable archive — the source of truth
     releases.json  repo.json  views.json  clones.json  paths.json  referrers.json
+    stargazers.json  forks.json  commits-README.md.json
+  raw/commits/<sha>.json       per-commit diff sizes, shared by every snapshot
   stats.db                     derived, disposable, rebuildable
 ```
+
+`commits-<path>.json` names its own path inside the file, so replaying an archive does
+not depend on `GIT_STATS_TRACK_PATHS` still holding the value it had at capture time —
+change what you track and the old histories keep meaning what they meant. The
+`raw/commits/` cache sits outside the timestamped directories because a commit is
+immutable: one fetch is good forever, however many snapshots later refer to it.
 
 Both `collect` and `rebuild` write to the database through the same ingest path, so a
 rebuild reproduces exactly what collection produced. The database is safe to delete;
@@ -205,11 +263,21 @@ GROUP BY a.release_tag HAVING delta > 0 ORDER BY delta DESC;
 
 -- Merged daily traffic (only days captured inside the 14-day window exist)
 SELECT day, count, uniques FROM traffic_day WHERE metric = 'clones' ORDER BY day;
+
+-- New stars per day next to what shipped that day
+SELECT d.day, d.stars, COALESCE(r.tags, '') AS released, COALESCE(c.subjects, '') AS wrote
+FROM (SELECT substr(starred_at, 1, 10) AS day, COUNT(*) AS stars
+      FROM stargazer GROUP BY day) d
+LEFT JOIN (SELECT substr(published_at, 1, 10) AS day, GROUP_CONCAT(tag, ' ') AS tags
+           FROM release GROUP BY day) r ON r.day = d.day
+LEFT JOIN (SELECT substr(committed_at, 1, 10) AS day, GROUP_CONCAT(subject, '; ') AS subjects
+           FROM file_change GROUP BY day) c ON c.day = d.day
+ORDER BY d.stars DESC LIMIT 20;
 ```
 
 Tables: `snapshot`, `asset_count`, `traffic_day`, `traffic_window`, `traffic_top`,
-`repo_stat`, `stargazer`. The schema is documented inline in
-[internal/store/store.go](internal/store/store.go).
+`repo_stat`, `stargazer`, `fork`, `release`, `file_change`, `backfill`. The schema is
+documented inline in [internal/store/store.go](internal/store/store.go).
 
 ## What is and isn't retroactive
 
@@ -221,6 +289,9 @@ Only one of these datasets starts from zero the day you begin collecting:
 | Views / clones / referrers / paths | **The previous 14 days**, daily buckets | window slides; miss >14 days and those days are gone |
 | Stars / forks / watchers | current values only | trend accrues from your first snapshot |
 | Star history | fully retroactive — every star carries its own date | complete after one backfill |
+| Fork history | fully retroactive — every fork carries its creation date | complete after one backfill |
+| Release dates | fully retroactive — back to the first release | every collection re-confirms them |
+| Tracked-path commits | fully retroactive — back to the first commit | one cheap request per path, every run |
 
 So the 14-day limit is not "14 days from when you start" — the first call already
 hands you the preceding fortnight. The constraint is on the *gap between runs*: as
@@ -230,6 +301,33 @@ continuous indefinitely, and `traffic_day` accumulates it forever.
 Release counters behave the opposite way: the all-time total is available instantly
 and is never lost, but the *history* of how it got there does not exist and can only
 be built forward from your first snapshot.
+
+## Lining events up against the numbers
+
+Every time chart carries markers for two kinds of event: a release, and a commit
+touching a tracked path — `README.md` by default, configurable with
+`GIT_STATS_TRACK_PATHS`. Both are retroactively complete, so the markers reach back to
+the project's first commit whether or not you were collecting at the time.
+
+The dashboard adds two views built on them. **What each event did** compares new stars
+per day in the seven days before an event against the seven days from it onward. Stars
+are used because their history is the only complete one here; views and clones exist
+only for days captured inside the 14-day window, so for most events there is nothing on
+the other side of the comparison to look at. **By week** aggregates releases, tracked
+changes and arrivals into ISO weeks.
+
+Two things the tables do rather than paper over:
+
+- **They refuse.** A window whose two sides were not both observed for at least 60% of
+  their days prints `insufficient data` with the coverage, instead of a ratio computed
+  over whichever days happened to survive.
+- **They name the neighbours.** Any other event inside the same window is listed. If you
+  ship every other day, *every* row will carry them, and the honest reading is that no
+  single release is separable — which is what the weekly table is for.
+
+Nothing here establishes cause. There is no control period, no correction for the day of
+the week, and no sight of the thing that most often moves these numbers: somebody else
+linking to you. The referrer table is the only window onto that, and it covers 14 days.
 
 ## How to read the numbers
 
@@ -267,6 +365,13 @@ be built forward from your first snapshot.
   the same number. Never read clones as a user count.
 - **Counts include bots** — mirrors, scanners and CI all download releases, and GitHub
   does not separate them out.
+- **A star history rebuilt from the stargazer list is the stars that survived.** The list
+  holds only people who still star the repository, so anyone who starred and later
+  unstarred is absent from every past date too. Where the counter captured at the
+  earliest snapshot disagrees with the rebuilt history, the dashboard says so and by how
+  much. Fork history has the same blind spot for deleted forks.
+- **A dash in the weekly table is not a zero.** It marks a week outside that column's
+  coverage — mostly traffic, before collection began.
 
 ## What none of this measures
 
@@ -291,7 +396,9 @@ separate decision with its own tradeoffs.
 
 Collection is manual by design. If you want it automatic, a launchd agent or a systemd
 timer calling `collect` once a day is enough — and unlike cron, launchd fires on wake if
-the machine was asleep at the scheduled time. Until then: any traffic day not captured
+the machine was asleep at the scheduled time. For several repositories, one unit per
+`-env` file: they touch different data directories, so they can equally run in
+sequence or at once. Until then: any traffic day not captured
 within 14 days is lost, while release download counts are cumulative and never lost.
 
 ## Releases and CI

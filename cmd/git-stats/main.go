@@ -36,6 +36,10 @@ const (
 	// envAssetPrefix overrides the release asset filename prefix, which
 	// otherwise defaults to the repository name.
 	envAssetPrefix = "GIT_STATS_ASSET_PREFIX"
+	// envTrackPaths lists repository paths whose commit history is captured, so
+	// changes to them can be lined up against the acquisition series. Comma
+	// separated; a trailing slash tracks a whole directory.
+	envTrackPaths = "GIT_STATS_TRACK_PATHS"
 	// envDir overrides the default data directory.
 	envDir = "GIT_STATS_DIR"
 	// envAPIBase overrides the API host. It exists for GitHub Enterprise
@@ -56,17 +60,25 @@ func usage() {
 	fmt.Fprint(os.Stderr, `git-stats — GitHub distribution metrics over time
 
 usage:
-  git-stats collect [-repo R] [-data DIR] [-stars]
-  git-stats report  [-repo R] [-since 30d] [-per-day] [-html FILE]
-  git-stats rebuild [-repo R] [-data DIR]
-  git-stats backfill-stars [-repo R] [-data DIR]
+  git-stats collect [-env FILE] [-repo R] [-data DIR] [-stars] [-forks] [-track PATHS]
+  git-stats report  [-env FILE] [-repo R] [-since 30d] [-per-day] [-html FILE]
+  git-stats rebuild [-env FILE] [-repo R] [-data DIR]
+  git-stats backfill [-env FILE] [-repo R] [-data DIR]
+  git-stats backfill-stars [-env FILE] [-repo R] [-data DIR]
   git-stats version
+
+  -env names a configuration file instead of searching for .env, which is how one
+  binary tracks several repositories. Give each its own file, and set
+  GIT_STATS_DIR in every one so they cannot share a data directory.
 
 commands:
   collect         snapshot every available endpoint into the archive and database
   report          summarise trends (terminal, or -html for a dashboard)
   rebuild         discard the database and replay the whole archive into a new one
-  backfill-stars  fetch the complete star history (each star carries its own date)
+  backfill        fetch every history that dates itself — stars, forks, and the diff
+                  size of each tracked commit. Complete back to the first commit and
+                  worth running once; the per-commit half is cached forever after.
+  backfill-stars  the star history alone
 
 environment:
   GIT_STATS_REPO          repository to track, as owner/name. Required; -repo overrides it.
@@ -76,12 +88,17 @@ environment:
   GIT_STATS_ASSET_PREFIX  release asset filename prefix, for the per-platform
                           breakdown of <prefix>-<version>-<os>-<arch>.<ext>.
                           Defaults to the repository name.
+  GIT_STATS_TRACK_PATHS   comma-separated paths whose commit history is captured, so
+                          changes to them can be lined up against the numbers.
+                          Defaults to README.md; a trailing slash tracks a directory.
   GIT_STATS_DIR           default data directory (otherwise ./data)
   GIT_STATS_API_BASE      API host (otherwise https://api.github.com). Point it at
                           https://HOST/api/v3 for GitHub Enterprise Server.
 
 All of these may instead be set in a .env file, read from the working directory or
-from the directory holding the binary. Exported variables take precedence over it.
+from the directory holding the binary, or from the file named by -env. Exported
+variables take precedence over it. A -env file that does not exist is an error,
+rather than a silent fall back to whichever .env happens to be nearby.
 `)
 }
 
@@ -92,8 +109,9 @@ func run(args []string) error {
 	}
 
 	// A .env alongside the tool supplies defaults for anything not already
-	// exported, so the token can live in a gitignored file.
-	env, err := dotenv.Load()
+	// exported, so the token can live in a gitignored file. -env names a
+	// different one, which is how one binary tracks several repositories.
+	env, err := loadEnv(args[1:])
 	if err != nil {
 		return err
 	}
@@ -103,9 +121,12 @@ func run(args []string) error {
 
 	switch args[0] {
 	case "collect":
-		return runCollect(ctx, args[1:], false, env)
+		return runCollect(ctx, args[1:], backfill{}, env)
 	case "backfill-stars":
-		return runCollect(ctx, args[1:], true, env)
+		return runCollect(ctx, args[1:], backfill{Stars: true}, env)
+	case "backfill":
+		return runCollect(ctx, args[1:],
+			backfill{Stars: true, Forks: true, CommitDetails: true}, env)
 	case "report":
 		return runReport(args[1:])
 	case "rebuild":
@@ -122,6 +143,45 @@ func run(args []string) error {
 	}
 }
 
+// loadEnv applies the configuration file, honouring -env if it is present.
+//
+// The flag is read here, by hand, rather than through the FlagSet that later
+// parses it. It has to be: every other flag takes its default from the
+// environment, and this file is what supplies that environment, so a FlagSet
+// cannot compute its own defaults from a value it has not parsed yet.
+func loadEnv(args []string) (dotenv.Loaded, error) {
+	if path := envFileArg(args); path != "" {
+		return dotenv.LoadFile(path)
+	}
+	return dotenv.Load()
+}
+
+// envFileArg extracts -env from a command's arguments, accepting the four
+// spellings Go's flag package would.
+func envFileArg(args []string) string {
+	for i, arg := range args {
+		name, value, hasValue := strings.Cut(arg, "=")
+		if name != "-env" && name != "--env" {
+			continue
+		}
+		if hasValue {
+			return value
+		}
+		if i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// envFlag registers -env so it parses and appears in -h. Its value is already
+// applied by loadEnv; declaring it here is what keeps the FlagSet from
+// rejecting it as unknown.
+func envFlag(fs *flag.FlagSet) {
+	fs.String("env", "",
+		"read configuration from this file instead of searching for .env")
+}
+
 // dataDirFlag registers the shared -data flag.
 func dataDirFlag(fs *flag.FlagSet) *string {
 	def := os.Getenv(envDir)
@@ -129,6 +189,35 @@ func dataDirFlag(fs *flag.FlagSet) *string {
 		def = "data"
 	}
 	return fs.String("data", def, "data directory holding raw/ and stats.db")
+}
+
+// warnSharedDataDir fires when a named env file leaves the data directory at
+// its default.
+//
+// Tracking two repositories through two -env files is the point of the flag,
+// but if neither names a directory both runs land in ./data and interleave
+// two repositories into one archive — releases from one and traffic from the
+// other, in a single snapshot series that no rebuild can separate afterwards.
+// The archive is the source of truth precisely so that cannot happen, so this
+// is worth a word before the first collection rather than after the tenth.
+func warnSharedDataDir(fs *flag.FlagSet, args []string, dataDir string) {
+	if envFileArg(args) == "" || os.Getenv(envDir) != "" {
+		return
+	}
+	explicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "data" {
+			explicit = true
+		}
+	})
+	if explicit {
+		return
+	}
+	fmt.Printf("WARNING: -env was given but %s is not set, so this run uses the default\n"+
+		"         data directory %q, relative to the working directory. Two repositories\n"+
+		"         collected this way share one archive and cannot be separated later.\n"+
+		"         Set %s in each env file, or pass -data.\n",
+		envDir, dataDir, envDir)
 }
 
 // repoFlag registers the shared -repo flag, defaulting to the configured
@@ -163,11 +252,43 @@ func assetNamer(repo string) github.AssetNamer {
 	return github.NewAssetNamer(prefix)
 }
 
-func runCollect(ctx context.Context, args []string, forceStars bool, env dotenv.Loaded) error {
+// backfill selects the retroactive crawls a run performs on top of the ordinary
+// per-snapshot fetches. Each is a paginated crawl or a per-commit request, so
+// none of them runs by default.
+type backfill struct {
+	Stars         bool
+	Forks         bool
+	CommitDetails bool
+}
+
+// trackPaths returns the repository paths whose commit history is captured.
+// README.md is the default because it is the one file every visitor reads and
+// the one whose rewrites plausibly move the numbers this tool collects.
+func trackPaths() []string {
+	raw := strings.TrimSpace(os.Getenv(envTrackPaths))
+	if raw == "" {
+		return []string{"README.md"}
+	}
+	var out []string
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func runCollect(ctx context.Context, args []string, force backfill, env dotenv.Loaded) error {
 	fs := flag.NewFlagSet("collect", flag.ContinueOnError)
+	envFlag(fs)
 	repoArg := repoFlag(fs, "owner/name to collect")
 	data := dataDirFlag(fs)
 	stars := fs.Bool("stars", false, "also backfill the full stargazer history")
+	forks := fs.Bool("forks", false, "also backfill the full fork history")
+	details := fs.Bool("commit-details", false,
+		"also fetch each tracked commit's diff size (one request per commit, cached)")
+	track := fs.String("track", strings.Join(trackPaths(), ","),
+		"comma-separated paths whose commit history is captured")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -175,16 +296,27 @@ func runCollect(ctx context.Context, args []string, forceStars bool, env dotenv.
 	if err != nil {
 		return err
 	}
+	warnSharedDataDir(fs, args, *data)
+
+	var paths []string
+	for _, p := range strings.Split(*track, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			paths = append(paths, p)
+		}
+	}
 
 	token, source := github.TokenFrom()
 	cfg := collect.Config{
-		Repo:    repo,
-		Token:   token,
-		DataDir: *data,
-		Assets:  assetNamer(repo),
-		APIBase: strings.TrimRight(strings.TrimSpace(os.Getenv(envAPIBase)), "/"),
-		Stars:   *stars || forceStars,
-		Log:     os.Stdout,
+		Repo:          repo,
+		Token:         token,
+		DataDir:       *data,
+		Assets:        assetNamer(repo),
+		APIBase:       strings.TrimRight(strings.TrimSpace(os.Getenv(envAPIBase)), "/"),
+		Stars:         *stars || force.Stars,
+		Forks:         *forks || force.Forks,
+		CommitDetails: *details || force.CommitDetails,
+		TrackPaths:    paths,
+		Log:           os.Stdout,
 	}
 	if cfg.APIBase != "" {
 		fmt.Printf("api: %s\n", cfg.APIBase)
@@ -213,6 +345,7 @@ func runCollect(ctx context.Context, args []string, forceStars bool, env dotenv.
 
 func runReport(args []string) error {
 	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	envFlag(fs)
 	repoArg := repoFlag(fs, "repository label for the report header")
 	data := dataDirFlag(fs)
 	since := fs.String("since", "", "limit deltas to a trailing window, e.g. 30d or 12h")
@@ -250,6 +383,7 @@ func runReport(args []string) error {
 
 func runRebuild(args []string) error {
 	fs := flag.NewFlagSet("rebuild", flag.ContinueOnError)
+	envFlag(fs)
 	repoArg := repoFlag(fs, "owner/name the archive was collected from")
 	data := dataDirFlag(fs)
 	if err := fs.Parse(args); err != nil {

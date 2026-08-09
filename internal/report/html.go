@@ -62,6 +62,8 @@ type htmlData struct {
 	Views        template.HTML
 	Clones       template.HTML
 	Stars        template.HTML
+	StarsDaily   template.HTML
+	Forks        template.HTML
 	// Coverage strings state the period each series spans, which is not the
 	// same as when the snapshots were taken.
 	ViewsCoverage  string
@@ -70,10 +72,24 @@ type htmlData struct {
 	ClonesUniques  string
 	HasTraffic     bool
 	HasStars       bool
+	HasForks       bool
 	Releases       []row
 	Referrers      []row
 	Paths          []row
 	Notes          []string
+
+	// Event overlay and the tables derived from it.
+	HasEvents      bool
+	HasFileChanges bool
+	Timeline       []row
+	TimelineNote   string
+	ImpactMetric   string
+	ImpactWindow   int
+	Weeks          []row
+	WeeklyNote     string
+	Withdrawn      string
+	TrackedPaths   string
+	EventsCounted  string
 }
 
 func buildHTML(db *store.DB, opts Options) (htmlData, error) {
@@ -159,6 +175,13 @@ func buildHTML(db *store.DB, opts Options) (htmlData, error) {
 		})
 	}
 
+	// Releases and tracked-file changes, overlaid on every time chart below so
+	// a movement and its candidate cause are read off one picture.
+	marks, err := buildEvents(&d, db)
+	if err != nil {
+		return d, err
+	}
+
 	// Cumulative downloads: exact at every snapshot, unlike interval deltas,
 	// which makes it the honest series to chart when spacing is irregular.
 	cum, err := db.Cumulative()
@@ -169,7 +192,7 @@ func buildHTML(db *store.DB, opts Options) (htmlData, error) {
 	for _, c := range cum {
 		pts = append(pts, Point{T: c.TakenAt, V: float64(c.Total)})
 	}
-	d.Cumulative = LineChart(pts, "--series-1", "downloads")
+	d.Cumulative = MarkedLineChart(pts, "--series-1", "downloads", marks)
 
 	// Platform breakdown.
 	platformKeys := sortedKeys(totals.ByPlatform)
@@ -197,8 +220,8 @@ func buildHTML(db *store.DB, opts Options) (htmlData, error) {
 		return d, err
 	}
 	d.HasTraffic = len(views) > 0 || len(clones) > 0
-	d.Views = LineChart(views, "--series-1", "views")
-	d.Clones = LineChart(clones, "--series-2", "clones")
+	d.Views = MarkedLineChart(views, "--series-1", "views", marks)
+	d.Clones = MarkedLineChart(clones, "--series-2", "clones", marks)
 	d.ViewsCoverage = coverageOf(views, opts.now())
 	d.ClonesCoverage = coverageOf(clones, opts.now())
 
@@ -231,7 +254,31 @@ func buildHTML(db *store.DB, opts Options) (htmlData, error) {
 			}
 			starPts = append(starPts, Point{T: day, V: float64(s.Uniques)}) // running total
 		}
-		d.Stars = LineChart(starPts, "--series-3", "stars")
+		d.Stars = MarkedLineChart(starPts, "--series-3", "stars", marks)
+
+		// The same history as columns. A day that brought twenty stars is a
+		// column here and a barely steeper stretch of the curve above, and it
+		// is the column that can be lined up against an event.
+		daily, err := db.DailySeries(store.MetricStars)
+		if err != nil {
+			return d, err
+		}
+		d.StarsDaily = ColumnChart(seriesPoints(daily), "--series-3", "new stars", marks)
+	}
+
+	forks, err := db.DailySeries(store.MetricForks)
+	if err != nil {
+		return d, err
+	}
+	if len(forks.Days) > 0 {
+		d.HasForks = true
+		var running float64
+		forkPts := make([]Point, 0, len(forks.Days))
+		for _, day := range forks.Days {
+			running += day.Value
+			forkPts = append(forkPts, Point{T: day.Day, V: running})
+		}
+		d.Forks = MarkedLineChart(forkPts, "--series-4", "forks", marks)
 	}
 
 	byTotal := append([]store.ReleaseTotal(nil), totals.ByRelease...)
@@ -281,6 +328,20 @@ func notes(d htmlData, win windowSummary) []string {
 		out = append(out, fmt.Sprintf(
 			"Deltas cover %s of wall-clock time between snapshots, not a fixed period. "+
 				"Collection is manual, so intervals are irregular by design.", humanDays(win.Days)))
+	}
+	if d.HasEvents {
+		out = append(out,
+			"Event markers are annotations, not explanations. Nothing here establishes that a "+
+				"release or a README change caused a movement: the comparison is one project "+
+				"against its own recent past, with no control period, no correction for the day "+
+				"of the week, and no visibility into the thing that most often moves these "+
+				"numbers — somebody else linking to the repository. The referrer table is the "+
+				"only view onto that, and it covers 14 days.",
+			"The two halves of the timeline reach back different distances. Releases and tracked "+
+				"file changes are complete to the project's first commit, and so is the star "+
+				"history, so those can be compared over the whole life of the project. Views, "+
+				"clones and download counters only exist from the first collection onward, so "+
+				"for anything older the event is dated but its effect on them is unknowable.")
 	}
 	out = append(out,
 		"Install scripts and self-updaters fetch an artifact and its checksum together, so the "+
@@ -436,6 +497,14 @@ var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!doctype htm
   .bar-label { fill: var(--text-secondary); font-size: 12.5px; }
   .bar-value { fill: var(--text-primary); font-size: 12.5px; font-weight: 600; }
   .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  /* Annotations sit behind the data they explain: dashed, thin, and never
+     heavier than the series itself. */
+  .mark { stroke-width: 1; stroke-dasharray: 3 3; opacity: .55; }
+  .mark-flag { opacity: .9; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; color: var(--text-secondary);
+            font-size: 12.5px; margin: 0 0 10px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
   .area { opacity: .10; stroke: none; }
   .dot { stroke: var(--surface-1); stroke-width: 2; }
   .hit, .bar { cursor: crosshair; }
@@ -472,6 +541,15 @@ var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!doctype htm
     release data — the rest were failed runs and are excluded from download figures rather
     than counted as zero{{end}}. Those are collection times; each figure below states the
     period it actually describes, which is usually much longer.</p>
+
+  {{if .HasEvents}}
+  <p class="legend">
+    <span><i style="background:var(--series-4)"></i>release</span>
+    {{if .HasFileChanges}}<span><i style="background:var(--series-2)"></i>{{.TrackedPaths}}
+      changed</span>{{end}}
+    <span>{{.EventsCounted}}, marked on every chart below</span>
+  </p>
+  {{end}}
 
   <div class="tiles">
     {{range .Tiles}}
@@ -521,8 +599,60 @@ var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!doctype htm
   <figure>
     <h2>Stars over time</h2>
     <p class="caption">Backfilled from each star's own timestamp, so this history is complete
-      rather than sampled.</p>
+      rather than sampled. {{.Withdrawn}}</p>
     {{.Stars}}
+  </figure>
+  <figure>
+    <h2>New stars per day</h2>
+    <p class="caption">The same history as arrivals rather than as a running total. A day that
+      brought a dozen stars is a column here and an imperceptible change of slope above, and it
+      is the column that can be lined up against a release or a rewritten README.</p>
+    {{.StarsDaily}}
+  </figure>
+  {{end}}
+
+  {{if .HasForks}}
+  <figure>
+    <h2>Forks over time</h2>
+    <p class="caption">Cumulative, backfilled from each fork's creation date. Deleted forks are
+      absent from the list this is built from, so the early part of the curve understates what
+      the fork count was at the time — the same blind spot the star history has.</p>
+    {{.Forks}}
+  </figure>
+  {{end}}
+
+  {{if .Timeline}}
+  <figure>
+    <h2>What each event did</h2>
+    <p class="caption">Compares {{.ImpactMetric}} per day in the {{.ImpactWindow}} days before
+      each event against the {{.ImpactWindow}} days from it onward. The event's own day counts
+      as after. Stars are used because their history is the only one here that is complete back
+      to the project's start; views and clones exist only for days captured inside GitHub's
+      14-day window, so most events predate any traffic data entirely.
+      <strong>A row with anything in the last column is not attributable</strong> — another
+      event landed inside the same window, and the two cannot be told apart by this arithmetic.
+      {{.TimelineNote}}</p>
+    <table>
+      <thead><tr><th>Date</th><th>Event</th><th>What</th><th>Size</th>
+        <th>New stars/day, before → after</th><th>Also inside the window</th></tr></thead>
+      <tbody>{{range .Timeline}}<tr>{{range .Cells}}<td>{{.}}</td>{{end}}</tr>{{end}}</tbody>
+    </table>
+  </figure>
+  {{end}}
+
+  {{if .Weeks}}
+  <figure>
+    <h2>By week</h2>
+    <p class="caption">When releases are only a day or two apart no single one has a clean
+      window, and every per-event figure above is confounded. This is the question that
+      survives that: whether weeks with more shipping and more writing are weeks with more
+      arrivals. It is still a correlation over few weeks, and nothing here controls for
+      whatever else happened. {{.WeeklyNote}}</p>
+    <table>
+      <thead><tr><th>Week of</th><th>Releases</th><th>Tracked changes</th>
+        <th>New stars</th><th>Views</th><th>Unique cloners</th></tr></thead>
+      <tbody>{{range .Weeks}}<tr>{{range .Cells}}<td>{{.}}</td>{{end}}</tr>{{end}}</tbody>
+    </table>
   </figure>
   {{end}}
 

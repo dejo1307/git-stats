@@ -115,4 +115,52 @@ CREATE TABLE IF NOT EXISTS stargazer (
   login      TEXT PRIMARY KEY,
   starred_at TEXT NOT NULL
 );
+
+-- Fork history. Like stargazer, every row dates itself, so one backfill is
+-- complete rather than sampled.
+CREATE TABLE IF NOT EXISTS fork (
+  full_name  TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL
+);
+
+-- When each self-dating history was last captured. Without it a quiet stretch
+-- is indistinguishable from an uncollected one: the stargazer table simply has
+-- no rows for either, and a week of no new stars would be excused from every
+-- comparison instead of counted as the zero it is.
+CREATE TABLE IF NOT EXISTS backfill (
+  kind        TEXT PRIMARY KEY,   -- stars | forks
+  captured_at TEXT NOT NULL       -- RFC3339 UTC, the latest snapshot holding it
+);
+
+-- Releases as dated events, as opposed to asset_count's per-snapshot counters.
+-- Not scoped to a snapshot: published_at is a property of the release, so the
+-- table is complete from the first snapshot that saw it and re-affirmed by
+-- every later one.
+CREATE TABLE IF NOT EXISTS release (
+  tag          TEXT PRIMARY KEY,
+  name         TEXT NOT NULL,
+  published_at TEXT NOT NULL,      -- RFC3339 UTC
+  prerelease   INTEGER NOT NULL,
+  draft        INTEGER NOT NULL,
+  -- Length of the release notes. An empty body means the release was published
+  -- without anything to read, which is worth separating from an announced one
+  -- when asking what a release did to the numbers.
+  body_len     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS release_by_date ON release(published_at);
+
+-- Commits touching a tracked path, e.g. README.md. This history has no
+-- retention limit, so it is complete back to the repository's first commit.
+-- additions/deletions are NULL until the per-commit detail is fetched, which
+-- is a separate request per commit and therefore opt-in.
+CREATE TABLE IF NOT EXISTS file_change (
+  path         TEXT NOT NULL,
+  sha          TEXT NOT NULL,
+  committed_at TEXT NOT NULL,      -- RFC3339 UTC
+  subject      TEXT NOT NULL,
+  additions    INTEGER,
+  deletions    INTEGER,
+  PRIMARY KEY (path, sha)
+);
+CREATE INDEX IF NOT EXISTS file_change_by_date ON file_change(committed_at);
 `
