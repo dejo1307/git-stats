@@ -38,33 +38,60 @@ func (l Loaded) Supplied(key string) bool { return l.Applied[key] }
 // binary, so the tool finds its own .env however it was invoked.
 func Load() (Loaded, error) {
 	for _, dir := range searchDirs() {
-		path := filepath.Join(dir, Filename)
-		f, err := os.Open(path)
-		if os.IsNotExist(err) {
-			continue
+		loaded, found, err := apply(filepath.Join(dir, Filename))
+		if err != nil || found {
+			return loaded, err
 		}
-		if err != nil {
-			return Loaded{}, err
-		}
-		defer f.Close() //nolint:errcheck // read-only; the values are already parsed
-
-		vars, err := Parse(f)
-		if err != nil {
-			return Loaded{}, fmt.Errorf("%s: %w", path, err)
-		}
-		loaded := Loaded{Path: path, Applied: map[string]bool{}}
-		for k, v := range vars {
-			if _, present := os.LookupEnv(k); present {
-				continue
-			}
-			if err := os.Setenv(k, v); err != nil {
-				return Loaded{}, err
-			}
-			loaded.Applied[k] = true
-		}
-		return loaded, nil
 	}
 	return Loaded{}, nil
+}
+
+// LoadFile reads one named file instead of searching for it.
+//
+// A missing file is an error here, where it is normal in Load. The caller named
+// this file, and one configuration file is what separates tracking one
+// repository from tracking another: falling back to whatever .env happened to
+// sit in the working directory would archive the wrong repository's numbers
+// into the wrong data directory, which is the one mistake this tool is built
+// not to make quietly.
+func LoadFile(path string) (Loaded, error) {
+	loaded, found, err := apply(path)
+	if err != nil {
+		return Loaded{}, err
+	}
+	if !found {
+		return Loaded{}, fmt.Errorf("no such env file: %s", path)
+	}
+	return loaded, nil
+}
+
+// apply reads one file and sets any variable not already in the environment.
+// found is false when the file does not exist, which only Load treats as fine.
+func apply(path string) (loaded Loaded, found bool, err error) {
+	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return Loaded{}, false, nil
+	}
+	if err != nil {
+		return Loaded{}, false, err
+	}
+	defer f.Close() //nolint:errcheck // read-only; the values are already parsed
+
+	vars, err := Parse(f)
+	if err != nil {
+		return Loaded{}, true, fmt.Errorf("%s: %w", path, err)
+	}
+	loaded = Loaded{Path: path, Applied: map[string]bool{}}
+	for k, v := range vars {
+		if _, present := os.LookupEnv(k); present {
+			continue
+		}
+		if err := os.Setenv(k, v); err != nil {
+			return Loaded{}, true, err
+		}
+		loaded.Applied[k] = true
+	}
+	return loaded, true, nil
 }
 
 func searchDirs() []string {

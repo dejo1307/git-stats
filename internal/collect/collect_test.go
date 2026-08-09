@@ -235,3 +235,87 @@ func TestRunTwiceProducesTwoSnapshotsAndNoPhantomDownloads(t *testing.T) {
 		t.Errorf("interval total = %d, want 0 for identical counters", intervals[0].Total)
 	}
 }
+
+// TestRunCapturesTrackedPaths covers the one series that is both complete and
+// cheap: commit history has no retention limit, so a single request per path
+// dates every change a reader could have noticed, all the way back.
+func TestRunCapturesTrackedPaths(t *testing.T) {
+	var detailRequests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/traffic/"):
+			w.Header().Set("X-RateLimit-Remaining", "4999")
+			w.WriteHeader(http.StatusForbidden)
+		case strings.HasSuffix(r.URL.Path, "/releases"):
+			fmt.Fprint(w, releasesBody)
+		case strings.HasSuffix(r.URL.Path, "/commits"):
+			if got := r.URL.Query().Get("path"); got != "README.md" {
+				t.Errorf("commits path = %q, want README.md", got)
+			}
+			fmt.Fprint(w, `[{"sha":"abc123","commit":{"message":"Rewrite the pitch",
+				"committer":{"date":"2026-08-01T10:00:00Z"}}}]`)
+		case strings.Contains(r.URL.Path, "/commits/"):
+			detailRequests++
+			fmt.Fprint(w, `{"sha":"abc123","files":[
+				{"filename":"README.md","additions":40,"deletions":12}]}`)
+		default:
+			fmt.Fprint(w, `{"stargazers_count":78,"forks_count":11,"subscribers_count":2}`)
+		}
+	}))
+	defer srv.Close()
+	dir := t.TempDir()
+
+	cfg := collect.Config{
+		Repo:          "o/r",
+		DataDir:       dir,
+		APIBase:       srv.URL,
+		Assets:        github.NewAssetNamer("widget"),
+		TrackPaths:    []string{"README.md"},
+		CommitDetails: true,
+		Now:           time.Date(2026, 8, 4, 9, 0, 0, 0, time.UTC),
+		Log:           io.Discard,
+	}
+	res, err := collect.Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Commits != 1 || res.Details != 1 {
+		t.Errorf("captured %d commits and %d details, want 1 and 1", res.Commits, res.Details)
+	}
+	if _, err := os.Stat(filepath.Join(res.Snapshot.Dir, store.CommitsFile("README.md"))); err != nil {
+		t.Errorf("archive is missing the tracked path history: %v", err)
+	}
+
+	db, err := store.Open(store.DBPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	events, err := db.Events()
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	var change *store.Event
+	for i := range events {
+		if events[i].Kind == store.EventFileChange {
+			change = &events[i]
+		}
+	}
+	if change == nil {
+		t.Fatal("the README change did not reach the event timeline")
+	}
+	if change.Size != 52 {
+		t.Errorf("change size = %d, want 52 lines", change.Size)
+	}
+
+	// A commit is immutable, so a second run must reuse the cached detail
+	// rather than spend another request on it.
+	cfg.Now = time.Date(2026, 8, 5, 9, 0, 0, 0, time.UTC)
+	if _, err := collect.Run(context.Background(), cfg); err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if detailRequests != 1 {
+		t.Errorf("commit detail fetched %d times, want 1 — the cache was not used",
+			detailRequests)
+	}
+}

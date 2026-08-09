@@ -2,9 +2,11 @@ package store
 
 import (
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -22,6 +24,18 @@ const (
 	FilePaths      = "paths.json"
 	FileReferrers  = "referrers.json"
 	FileStargazers = "stargazers.json"
+	FileForks      = "forks.json"
+
+	// commitsPrefix marks the per-tracked-path commit histories. One file per
+	// path, each naming its own path inside, so replaying an archive does not
+	// depend on the tracked-path setting still holding its old value.
+	commitsPrefix = "commits-"
+
+	// commitCacheSubdir holds per-commit diff stats, shared by every snapshot
+	// rather than stored per run: a commit is immutable, so one fetch is good
+	// forever. It sits inside the archive root, which List ignores because its
+	// name is not a timestamp.
+	commitCacheSubdir = "commits"
 )
 
 // Archive is the append-only directory of raw API responses.
@@ -34,6 +48,9 @@ func NewArchive(dir string) *Archive { return &Archive{Root: dir} }
 type Snapshot struct {
 	TakenAt time.Time
 	Dir     string
+	// Root is the archive the snapshot belongs to, which is where per-commit
+	// data shared across runs lives.
+	Root string
 }
 
 // Create makes the directory for a new snapshot. Runs are keyed to the second,
@@ -44,7 +61,84 @@ func (a *Archive) Create(takenAt time.Time) (Snapshot, error) {
 	if err := ensureDir(dir); err != nil {
 		return Snapshot{}, err
 	}
-	return Snapshot{TakenAt: takenAt.UTC().Truncate(time.Second), Dir: dir}, nil
+	return Snapshot{TakenAt: takenAt.UTC().Truncate(time.Second), Dir: dir, Root: a.Root}, nil
+}
+
+// CommitsFile is the archive filename holding one tracked path's history.
+// Characters a path may contain but a filename should not are replaced, and a
+// hash of the original is appended whenever that substitution loses
+// information, so two paths cannot collide onto one file.
+func CommitsFile(path string) string {
+	var b strings.Builder
+	lossy := false
+	for _, r := range path {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '.', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+			lossy = true
+		}
+	}
+	name := b.String()
+	if lossy {
+		h := fnv.New32a()
+		fmt.Fprint(h, path)
+		name = fmt.Sprintf("%s-%08x", name, h.Sum32())
+	}
+	return commitsPrefix + name + ".json"
+}
+
+// CommitsFiles lists the tracked-path histories captured in this snapshot.
+func (s Snapshot) CommitsFiles() ([]string, error) {
+	entries, err := os.ReadDir(s.Dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading snapshot %s: %w", s.Dir, err)
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), commitsPrefix) &&
+			strings.HasSuffix(e.Name(), ".json") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// CommitDetailPath is where one commit's diff stats are cached.
+func (s Snapshot) CommitDetailPath(sha string) string {
+	return filepath.Join(s.Root, commitCacheSubdir, sha+".json")
+}
+
+// WriteCommitDetail caches one commit's diff stats for every snapshot to use.
+func (s Snapshot) WriteCommitDetail(sha string, raw []byte) error {
+	path := s.CommitDetailPath(sha)
+	if err := ensureDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		return fmt.Errorf("writing %s: %w", path, err)
+	}
+	return nil
+}
+
+// ReadCommitDetail returns a cached commit's diff stats. found is false when
+// the commit has not been fetched in detail, which is the normal state until
+// `backfill` runs.
+func (s Snapshot) ReadCommitDetail(sha string) (raw []byte, found bool, err error) {
+	raw, err = os.ReadFile(s.CommitDetailPath(sha))
+	if os.IsNotExist(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return raw, true, nil
 }
 
 // Write stores one raw response verbatim.
@@ -90,7 +184,8 @@ func (a *Archive) List() ([]Snapshot, error) {
 		if err != nil {
 			continue
 		}
-		snaps = append(snaps, Snapshot{TakenAt: takenAt, Dir: filepath.Join(a.Root, e.Name())})
+		snaps = append(snaps, Snapshot{
+			TakenAt: takenAt, Dir: filepath.Join(a.Root, e.Name()), Root: a.Root})
 	}
 	sort.Slice(snaps, func(i, j int) bool { return snaps[i].TakenAt.Before(snaps[j].TakenAt) })
 	return snaps, nil

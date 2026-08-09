@@ -69,7 +69,80 @@ func Text(w io.Writer, db *store.DB, opts Options) error {
 	if err := writeTraffic(w, db); err != nil {
 		return err
 	}
-	return writeRepo(w, db)
+	if err := writeRepo(w, db); err != nil {
+		return err
+	}
+	return writeEvents(w, db)
+}
+
+// writeEvents lines the acquisition series up against releases and tracked
+// file changes, at the week grain the terminal has room for.
+func writeEvents(w io.Writer, db *store.DB) error {
+	weeks, err := db.WeeklyRollup(
+		[]string{store.MetricStars, store.MetricViews, store.MetricCloneUniques})
+	if err != nil {
+		return err
+	}
+	if len(weeks) == 0 {
+		return nil
+	}
+
+	fmt.Fprintln(w, "\nby week")
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "  week of\treleases\tchanges\tstars\tviews\tcloners")
+	// The recent end is what anyone can still act on, and a long project would
+	// otherwise scroll the useful rows off the top.
+	for _, wk := range lastWeeks(weeks, 10) {
+		label := wk.Start.Format("2006-01-02")
+		if wk.Partial {
+			label += " *"
+		}
+		fmt.Fprintf(tw, "  %s\t%d\t%d\t%s\t%s\t%s\n",
+			label, wk.Releases, wk.FileChanges,
+			weekCell(wk, store.MetricStars), weekCell(wk, store.MetricViews),
+			weekCell(wk, store.MetricCloneUniques))
+	}
+	tw.Flush()
+	fmt.Fprintln(w, "  — outside that column's coverage, not a zero;")
+	fmt.Fprintln(w, "  * only partly covered, so the totals are floors")
+
+	events, err := db.Events()
+	if err != nil || len(events) == 0 {
+		return err
+	}
+	stars, err := db.DailySeries(store.MetricStars)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(w, "\nlast events vs new stars (%dd before → %dd from the event)\n",
+		impactWindow, impactWindow)
+	tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	recent := events
+	if len(recent) > 8 {
+		recent = recent[len(recent)-8:]
+	}
+	for i := len(recent) - 1; i >= 0; i-- {
+		e := recent[i]
+		imp := store.EventImpact(stars, e, events, impactWindow)
+		note := ""
+		if n := len(imp.Confounded); n > 0 {
+			note = fmt.Sprintf("  (confounded: %d other event(s) in window)", n)
+		}
+		fmt.Fprintf(tw, "  %s\t%s\t%s%s\n",
+			e.At.Format("2006-01-02"), truncate(e.Label, 24), impactCell(imp), note)
+	}
+	tw.Flush()
+	fmt.Fprintln(w, "  correlation only: no control period, no weekday correction, and no")
+	fmt.Fprintln(w, "  sight of whoever linked to the repository that week.")
+	return nil
+}
+
+func lastWeeks(weeks []store.Week, n int) []store.Week {
+	if len(weeks) <= n {
+		return weeks
+	}
+	return weeks[len(weeks)-n:]
 }
 
 func filterSince(intervals []store.Interval, opts Options) []store.Interval {
