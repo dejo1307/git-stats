@@ -122,8 +122,42 @@ func IsForbidden(err error) bool {
 	}
 }
 
+// RateLimitError means the hourly request budget is spent. It is separate from
+// StatusError because it is neither a permission problem nor a transient one:
+// nothing about the request or the credential is wrong, and the only remedy is
+// to stop until Reset. A crawl that is priced per item — stargazer profiles
+// above all — has to be able to tell that apart and keep what it already has.
+type RateLimitError struct {
+	URL   string
+	Reset time.Time
+}
+
+func (e *RateLimitError) Error() string {
+	reset := "an unknown time"
+	if !e.Reset.IsZero() {
+		reset = e.Reset.Format(time.RFC3339)
+	}
+	return fmt.Sprintf("GET %s: rate limit exhausted, resets at %s", e.URL, reset)
+}
+
+// IsRateLimited reports whether err is the hourly budget running out.
+func IsRateLimited(err error) bool {
+	var rl *RateLimitError
+	return errors.As(err, &rl)
+}
+
 // get fetches one URL and returns the raw body exactly as received.
 func (c *Client) get(ctx context.Context, url string, accept string) ([]byte, *http.Response, error) {
+	return c.getWith(ctx, url, accept, "")
+}
+
+// getWith fetches one URL, optionally revalidating a cached copy.
+//
+// A non-empty etag turns the request conditional, and a 304 comes back with a
+// nil body and that status on the response. GitHub does not charge a 304
+// against the rate limit, which is what makes re-checking a cache of thousands
+// of profiles free.
+func (c *Client) getWith(ctx context.Context, url, accept, etag string) ([]byte, *http.Response, error) {
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
@@ -144,6 +178,9 @@ func (c *Client) get(ctx context.Context, url string, accept string) ([]byte, *h
 		if c.token != "" {
 			req.Header.Set("Authorization", "Bearer "+c.token)
 		}
+		if etag != "" {
+			req.Header.Set("If-None-Match", etag)
+		}
 
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
@@ -161,6 +198,10 @@ func (c *Client) get(ctx context.Context, url string, accept string) ([]byte, *h
 		switch {
 		case resp.StatusCode >= 200 && resp.StatusCode < 300:
 			return body, resp, nil
+		case resp.StatusCode == http.StatusNotModified && etag != "":
+			// The cached copy is still current. Only a conditional request can
+			// produce this, so it is never a surprise to an unconditional one.
+			return nil, resp, nil
 		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
 			// Transient: retry.
 			lastErr = &StatusError{Code: resp.StatusCode, URL: url, Body: string(body)}
@@ -168,8 +209,7 @@ func (c *Client) get(ctx context.Context, url string, accept string) ([]byte, *h
 		case resp.StatusCode == http.StatusForbidden && resp.Header.Get("X-RateLimit-Remaining") == "0":
 			// Rate limit exhaustion also arrives as 403; report when it lifts
 			// rather than mislabelling it a permission problem.
-			return nil, nil, fmt.Errorf("GET %s: rate limit exhausted, resets at %s",
-				url, rateLimitReset(resp))
+			return nil, nil, &RateLimitError{URL: url, Reset: rateLimitReset(resp)}
 		default:
 			return nil, nil, &StatusError{Code: resp.StatusCode, URL: url, Body: string(body)}
 		}
@@ -177,12 +217,14 @@ func (c *Client) get(ctx context.Context, url string, accept string) ([]byte, *h
 	return nil, nil, fmt.Errorf("GET %s: %w", url, lastErr)
 }
 
-func rateLimitReset(resp *http.Response) string {
+// rateLimitReset returns when the budget refills, or the zero time when the
+// response did not say.
+func rateLimitReset(resp *http.Response) time.Time {
 	sec, err := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64)
 	if err != nil {
-		return "unknown"
+		return time.Time{}
 	}
-	return time.Unix(sec, 0).Format(time.RFC3339)
+	return time.Unix(sec, 0)
 }
 
 // getJSON fetches a single JSON object and returns its raw bytes.

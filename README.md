@@ -152,6 +152,7 @@ gets working download trends, only without the platform charts.
 | Release downloads, repo counters | none (unauthenticated is fine, 60 req/h) |
 | Views, clones, referrers, paths | **classic** PAT with the `public_repo` scope |
 | Star history backfill | a credential the `/stargazers` endpoint accepts |
+| Stargazer profiles | any token — **unauthenticated returns every email as null** |
 
 Traffic data is owner-only: the token must belong to an account with push access to
 the repository you are tracking.
@@ -184,11 +185,12 @@ and can be caught up at any time; traffic cannot.
 ## Commands
 
 ```
-git-stats collect [-repo R] [-data DIR] [-stars] [-forks] [-track PATHS]
+git-stats collect [-repo R] [-data DIR] [-stars] [-forks] [-users] [-track PATHS]
 git-stats report  [-repo R] [-since 30d] [-per-day] [-html FILE]
 git-stats rebuild [-repo R] [-data DIR]
 git-stats backfill [-repo R] [-data DIR]
 git-stats backfill-stars [-repo R] [-data DIR]
+git-stats backfill-users [-repo R] [-data DIR] [-user-refresh 30d]
 git-stats version
 ```
 
@@ -200,11 +202,53 @@ Every command also takes `-env FILE` to read configuration from a named file —
 - `rebuild` deletes the database and replays the whole archive into a new one. It
   takes `-repo` even though it fetches nothing, because replaying re-derives the
   per-platform columns from asset filenames.
-- `backfill` fetches every history that dates itself: stars, forks, and the diff size of
-  each commit touching a tracked path. All three are complete back to the first commit,
-  so this is worth running once rather than repeatedly — the per-commit half is cached
-  permanently, since a commit cannot change.
+- `backfill` fetches every history that dates itself — stars, forks, and the diff size of
+  each commit touching a tracked path — plus the public profile of every stargazer. The
+  first three are complete back to the first commit, so this is worth running once rather
+  than repeatedly; the per-commit half is cached permanently, since a commit cannot change.
 - `backfill-stars` is the star history on its own.
+- `backfill-users` is the stargazer profiles on their own. See below.
+
+### Stargazer profiles
+
+`backfill-users` fetches each stargazer's public profile — the name, company, location,
+website and, where the account publishes one, the profile email. It is the only crawl
+here priced per person: one request per account against an hourly budget of 5000, where
+every other endpoint costs one request for the whole repository.
+
+Two things keep that affordable. Profiles are cached in `raw/users/`, outside the
+timestamped snapshots, so an account is fetched once and skipped by every later run; and
+`-user-refresh 30d` re-checks aged copies with the stored ETag, which GitHub answers
+`304 Not Modified` and does not charge against the rate limit at all. So the price is one
+request per *new* stargazer, paid once. Running out of budget mid-crawl is not a failure
+— it warns, says how many accounts it did not reach, and the next run resumes there.
+
+Three limits are worth knowing before running it:
+
+- **Your own repositories only.** GitHub no longer serves the stargazer list for a
+  repository you do not own: `/stargazers` answers `404` to a token without push access
+  and `401` unauthenticated, while GraphQL reports the star *count* alongside an empty
+  list. There is no credential that lifts this.
+- **A token is required for emails.** Unauthenticated the endpoint still answers `200`
+  and still returns the profile — with `email` always `null`. So an unauthenticated crawl
+  does not fail, it just reports every account as publishing no address. `collect` warns
+  when that happens.
+- **Most people publish no email.** The profile email is opt-in. Measured over 98 active
+  contributors to a large Go project — a generous proxy for stargazers — 94% had a name,
+  77% a location, 52% a company, 46% a website and 38% an email. Expect the last figure
+  to be lower for a random stargazer list.
+
+Everything collected is what GitHub shows any signed-in visitor on the profile page.
+Nothing is inferred, and commit author addresses — which people frequently never meant to
+publish — are deliberately not touched.
+
+> GitHub's Acceptable Use Policies, §7: *"You may not use information from the Service
+> (whether scraped, collected through our API, or obtained otherwise) for spamming
+> purposes, including for the purposes of sending unsolicited emails to users or selling
+> personal information, such as to recruiters, headhunters, and job boards."* Asking a
+> handful of users what they think of something they starred is not that; mailing the
+> list is. In the EU, unsolicited commercial email to individuals additionally needs
+> prior consent — in Germany under UWG §7.
 
 ## Data layout
 
@@ -216,6 +260,7 @@ data/
     releases.json  repo.json  views.json  clones.json  paths.json  referrers.json
     stargazers.json  forks.json  commits-README.md.json
   raw/commits/<sha>.json       per-commit diff sizes, shared by every snapshot
+  raw/users/<login>.json       stargazer profiles, shared by every snapshot
   stats.db                     derived, disposable, rebuildable
 ```
 
@@ -224,6 +269,12 @@ not depend on `GIT_STATS_TRACK_PATHS` still holding the value it had at capture 
 change what you track and the old histories keep meaning what they meant. The
 `raw/commits/` cache sits outside the timestamped directories because a commit is
 immutable: one fetch is good forever, however many snapshots later refer to it.
+
+`raw/users/` sits outside them for the same sharing reason, but a profile is not
+immutable the way a commit is, so each record wraps the response in an envelope naming
+when it was fetched and under which ETag. That state lives in the archive rather than in
+the database, so a `rebuild` restores the cache's freshness too — deleting `stats.db`
+still costs derive time and nothing else.
 
 Both `collect` and `rebuild` write to the database through the same ingest path, so a
 rebuild reproduces exactly what collection produced. The database is safe to delete;
@@ -276,8 +327,20 @@ ORDER BY d.stars DESC LIMIT 20;
 ```
 
 Tables: `snapshot`, `asset_count`, `traffic_day`, `traffic_window`, `traffic_top`,
-`repo_stat`, `stargazer`, `fork`, `release`, `file_change`, `backfill`. The schema is
-documented inline in [internal/store/store.go](internal/store/store.go).
+`repo_stat`, `stargazer`, `stargazer_profile`, `fork`, `release`, `file_change`,
+`backfill`. The schema is documented inline in
+[internal/store/store.go](internal/store/store.go).
+
+`stargazer_profile` is joined to `stargazer` on `login`, and a stargazer with no row
+there has not been fetched — which is different from an account that publishes nothing,
+whose row exists with NULLs in it:
+
+```sql
+SELECT s.login, s.starred_at, p.name, p.email, p.company, p.location
+FROM stargazer s LEFT JOIN stargazer_profile p USING (login)
+WHERE p.email IS NOT NULL
+ORDER BY s.starred_at DESC;
+```
 
 ## What is and isn't retroactive
 
@@ -290,6 +353,7 @@ Only one of these datasets starts from zero the day you begin collecting:
 | Stars / forks / watchers | current values only | trend accrues from your first snapshot |
 | Star history | fully retroactive — every star carries its own date | complete after one backfill |
 | Fork history | fully retroactive — every fork carries its creation date | complete after one backfill |
+| Stargazer profiles | current values only — a profile has no history anywhere | one request per new stargazer, cached |
 | Release dates | fully retroactive — back to the first release | every collection re-confirms them |
 | Tracked-path commits | fully retroactive — back to the first commit | one cheap request per path, every run |
 

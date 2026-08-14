@@ -5,6 +5,7 @@ package collect
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -32,6 +33,15 @@ type Config struct {
 	// Forks additionally backfills the full fork history. Like Stars it is a
 	// paginated crawl over a list that dates itself, so one run is complete.
 	Forks bool
+	// Users additionally fetches each stargazer's public profile, which is one
+	// request per account and so the most expensive thing here by a wide
+	// margin. It implies Stars: the profiles are looked up from the star list,
+	// which has to be current for the result to be.
+	Users bool
+	// UserRefresh revalidates a cached profile older than this. Zero fetches
+	// only the accounts that have never been fetched, which is the right
+	// default — a profile changes rarely and a stale name costs nothing.
+	UserRefresh time.Duration
 	// TrackPaths are repository paths whose commit history is captured, to date
 	// the changes a reader would have noticed — README.md above all. One cheap
 	// request each, so this runs on every collection.
@@ -58,6 +68,17 @@ type Result struct {
 	TrafficSkipped bool
 	// StarsSkipped is set when the stargazers endpoint rejected the credential.
 	StarsSkipped bool
+	// Profiles counts stargazer profiles fetched this run, Unchanged counts the
+	// revalidations GitHub answered 304 — free ones — and Missing counts
+	// accounts that no longer resolve, which is what a deleted or renamed
+	// account looks like from here.
+	Profiles          int
+	ProfilesUnchanged int
+	ProfilesMissing   int
+	// ProfilesRemaining is how many stargazers were still unfetched when the
+	// hourly rate limit ran out, so a run that stops early says how much of the
+	// list it did not reach rather than looking complete.
+	ProfilesRemaining int
 }
 
 // Run executes one collection. Traffic failures are non-fatal: releases are
@@ -67,6 +88,11 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	now := cfg.Now
 	if now.IsZero() {
 		now = time.Now()
+	}
+	// Profiles are looked up from the star list, so asking for them without it
+	// would either use a stale list or none at all.
+	if cfg.Users {
+		cfg.Stars = true
 	}
 
 	client := github.New(cfg.Repo, cfg.Token)
@@ -223,9 +249,120 @@ func fetch(ctx context.Context, cfg Config, client *github.Client, snap store.Sn
 				return err
 			}
 			logf(cfg, "stars: %d stargazers with timestamps\n", len(stars))
+			if cfg.Users {
+				if err := fetchUsers(ctx, cfg, client, snap, res, stars); err != nil {
+					return err
+				}
+			}
 		}
 	}
 
+	return nil
+}
+
+// fetchUsers caches the public profile of every stargazer.
+//
+// This is the only crawl here priced per person rather than per repository:
+// one request each against an hourly budget of five thousand, where every
+// other endpoint costs one request for the whole project. Two things keep it
+// affordable. A profile is cached under the archive root rather than inside a
+// snapshot, so an account is fetched once and skipped by every later run; and
+// a refresh revalidates with the stored ETag, which GitHub answers 304 and
+// does not charge against the rate limit at all. So the price is one request
+// per *new* stargazer, paid once.
+//
+// Running out of budget is not a failure. Every profile already written is
+// cached, and the next run resumes at the first account without one, so a
+// repository too large for one hour is collected across several rather than
+// not at all.
+func fetchUsers(ctx context.Context, cfg Config, client *github.Client,
+	snap store.Snapshot, res *Result, stars []github.Stargazer) error {
+
+	// UTC, like every other timestamp written into the archive.
+	now := cfg.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+
+	for i, s := range stars {
+		login := s.User.Login
+		if !github.ValidLogin(login) {
+			continue
+		}
+		cached, found, err := snap.ReadUser(login)
+		if err != nil {
+			return err
+		}
+		if found && !cached.Stale(now, cfg.UserRefresh) {
+			continue
+		}
+		// An ETag is sent only when the copy exists but has aged out. A missing
+		// one is a first fetch and has nothing to revalidate against.
+		etag := ""
+		if found {
+			etag = cached.ETag
+		}
+
+		raw, newETag, unchanged, err := client.UserProfile(ctx, login, etag)
+		switch {
+		case github.IsRateLimited(err):
+			res.ProfilesRemaining = len(stars) - i
+			logf(cfg, "WARNING: %v\n"+
+				"         %d of %d stargazer profiles were not fetched. Every profile already\n"+
+				"         written is cached, so re-running after the reset resumes where this\n"+
+				"         stopped rather than starting over.\n",
+				err, res.ProfilesRemaining, len(stars))
+			return nil
+		case github.IsForbidden(err):
+			// A deleted or renamed account, or one this credential cannot see.
+			// The star it left is still real and still counted.
+			res.ProfilesMissing++
+			continue
+		case err != nil:
+			return fmt.Errorf("fetching profile for %s: %w", login, err)
+		}
+
+		// An ETag earned without a credential is not kept. The body it stands
+		// for is the emailless one, so revalidating against it later — once a
+		// token exists — would risk a 304 that confirms a profile the tool was
+		// never allowed to see in full.
+		if !client.Authenticated() {
+			newETag = ""
+		}
+		rec := github.UserRecord{Login: login, FetchedAt: now, ETag: newETag}
+		if unchanged {
+			// Nothing changed, so only the freshness stamp moves — which is what
+			// stops the next refresh from asking again immediately.
+			res.ProfilesUnchanged++
+			rec.Profile = cached.Profile
+		} else {
+			res.Profiles++
+			rec.Profile = raw
+		}
+		encoded, err := json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		if err := snap.WriteUser(login, encoded); err != nil {
+			return err
+		}
+		if n := res.Profiles + res.ProfilesUnchanged; n > 0 && n%100 == 0 {
+			logf(cfg, "profiles: %d of %d…\n", n, len(stars))
+		}
+	}
+
+	if !client.Authenticated() {
+		// The endpoint answers 200 unauthenticated and returns the profile with
+		// email always null, so this would otherwise look like a repository
+		// whose stargazers happen to publish no addresses.
+		logf(cfg, "WARNING: profiles were fetched without a token, so every email is empty.\n"+
+			"         GitHub withholds the public profile email from unauthenticated requests\n"+
+			"         rather than refusing them. Set a token and re-run with -user-refresh 1s,\n"+
+			"         which ages every cached profile out and fetches them again.\n")
+	}
+	logf(cfg, "profiles: %d fetched, %d unchanged, %d unavailable\n",
+		res.Profiles, res.ProfilesUnchanged, res.ProfilesMissing)
 	return nil
 }
 

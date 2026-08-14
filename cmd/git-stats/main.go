@@ -60,11 +60,12 @@ func usage() {
 	fmt.Fprint(os.Stderr, `git-stats — GitHub distribution metrics over time
 
 usage:
-  git-stats collect [-env FILE] [-repo R] [-data DIR] [-stars] [-forks] [-track PATHS]
+  git-stats collect [-env FILE] [-repo R] [-data DIR] [-stars] [-forks] [-users] [-track PATHS]
   git-stats report  [-env FILE] [-repo R] [-since 30d] [-per-day] [-html FILE]
   git-stats rebuild [-env FILE] [-repo R] [-data DIR]
   git-stats backfill [-env FILE] [-repo R] [-data DIR]
   git-stats backfill-stars [-env FILE] [-repo R] [-data DIR]
+  git-stats backfill-users [-env FILE] [-repo R] [-data DIR] [-user-refresh 30d]
   git-stats version
 
   -env names a configuration file instead of searching for .env, which is how one
@@ -75,10 +76,16 @@ commands:
   collect         snapshot every available endpoint into the archive and database
   report          summarise trends (terminal, or -html for a dashboard)
   rebuild         discard the database and replay the whole archive into a new one
-  backfill        fetch every history that dates itself — stars, forks, and the diff
-                  size of each tracked commit. Complete back to the first commit and
-                  worth running once; the per-commit half is cached forever after.
+  backfill        fetch every history that dates itself — stars, forks, the diff size
+                  of each tracked commit, and each stargazer's public profile.
+                  Complete back to the first commit and worth running once; the
+                  per-commit and per-account halves are cached forever after.
   backfill-stars  the star history alone
+  backfill-users  the stargazer profiles alone — one request per account against an
+                  hourly budget of 5000, so a large repository takes several runs.
+                  Each is cached, so a later run resumes rather than starting over.
+                  Only works on repositories you own: GitHub refuses the stargazer
+                  list for everyone else's.
 
 environment:
   GIT_STATS_REPO          repository to track, as owner/name. Required; -repo overrides it.
@@ -124,9 +131,11 @@ func run(args []string) error {
 		return runCollect(ctx, args[1:], backfill{}, env)
 	case "backfill-stars":
 		return runCollect(ctx, args[1:], backfill{Stars: true}, env)
+	case "backfill-users":
+		return runCollect(ctx, args[1:], backfill{Users: true}, env)
 	case "backfill":
 		return runCollect(ctx, args[1:],
-			backfill{Stars: true, Forks: true, CommitDetails: true}, env)
+			backfill{Stars: true, Forks: true, CommitDetails: true, Users: true}, env)
 	case "report":
 		return runReport(args[1:])
 	case "rebuild":
@@ -259,6 +268,7 @@ type backfill struct {
 	Stars         bool
 	Forks         bool
 	CommitDetails bool
+	Users         bool
 }
 
 // trackPaths returns the repository paths whose commit history is captured.
@@ -287,6 +297,13 @@ func runCollect(ctx context.Context, args []string, force backfill, env dotenv.L
 	forks := fs.Bool("forks", false, "also backfill the full fork history")
 	details := fs.Bool("commit-details", false,
 		"also fetch each tracked commit's diff size (one request per commit, cached)")
+	users := fs.Bool("users", false,
+		"also fetch each stargazer's public profile (one request per account, cached; implies -stars)")
+	// A string rather than a flag.Duration, so this takes the same "30d"
+	// spelling -since does. Days are the unit anyone reaches for here, and Go's
+	// own duration syntax has no suffix for them.
+	userRefresh := fs.String("user-refresh", "",
+		"re-check cached profiles older than this, e.g. 30d; empty fetches only the ones never fetched")
 	track := fs.String("track", strings.Join(trackPaths(), ","),
 		"comma-separated paths whose commit history is captured")
 	if err := fs.Parse(args); err != nil {
@@ -297,6 +314,11 @@ func runCollect(ctx context.Context, args []string, force backfill, env dotenv.L
 		return err
 	}
 	warnSharedDataDir(fs, args, *data)
+
+	refresh, err := parseDuration("-user-refresh", *userRefresh)
+	if err != nil {
+		return err
+	}
 
 	var paths []string
 	for _, p := range strings.Split(*track, ",") {
@@ -315,6 +337,8 @@ func runCollect(ctx context.Context, args []string, force backfill, env dotenv.L
 		Stars:         *stars || force.Stars,
 		Forks:         *forks || force.Forks,
 		CommitDetails: *details || force.CommitDetails,
+		Users:         *users || force.Users,
+		UserRefresh:   refresh,
 		TrackPaths:    paths,
 		Log:           os.Stdout,
 	}
@@ -359,7 +383,7 @@ func runReport(args []string) error {
 		return err
 	}
 
-	window, err := parseDuration(*since)
+	window, err := parseDuration("-since", *since)
 	if err != nil {
 		return err
 	}
@@ -405,8 +429,10 @@ func runRebuild(args []string) error {
 }
 
 // parseDuration accepts Go durations plus a "d" suffix for days, which is the
-// natural unit for a window measured in snapshots.
-func parseDuration(s string) (time.Duration, error) {
+// natural unit for both a window measured in snapshots and a cache lifetime.
+// flag names the option in the error, since Go's own duration syntax rejects
+// the "30d" spelling a reader would reach for first.
+func parseDuration(flag, s string) (time.Duration, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return 0, nil
@@ -414,13 +440,13 @@ func parseDuration(s string) (time.Duration, error) {
 	if days, ok := strings.CutSuffix(s, "d"); ok {
 		n, err := strconv.ParseFloat(days, 64)
 		if err != nil {
-			return 0, fmt.Errorf("invalid -since %q: %w", s, err)
+			return 0, fmt.Errorf("invalid %s %q: %w", flag, s, err)
 		}
 		return time.Duration(n * float64(24*time.Hour)), nil
 	}
 	d, err := time.ParseDuration(s)
 	if err != nil {
-		return 0, fmt.Errorf("invalid -since %q: %w", s, err)
+		return 0, fmt.Errorf("invalid %s %q: %w", flag, s, err)
 	}
 	return d, nil
 }

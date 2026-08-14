@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/dejo1307/git-stats/internal/github"
@@ -269,8 +270,60 @@ func ingestStargazers(tx *sql.Tx, snap Snapshot) error {
 		); err != nil {
 			return fmt.Errorf("upserting stargazer: %w", err)
 		}
+		if err := ingestProfile(tx, snap, s.User.Login); err != nil {
+			return err
+		}
 	}
 	return markBackfilled(tx, "stars", snap.TakenAt)
+}
+
+// ingestProfile derives one stargazer's profile row from the cached record, if
+// that account has been fetched. Not being fetched is the ordinary case — the
+// crawl is opt-in and priced per account — so an absent record leaves the row
+// alone rather than clearing it.
+func ingestProfile(tx *sql.Tx, snap Snapshot, login string) error {
+	rec, found, err := snap.ReadUser(login)
+	if err != nil || !found {
+		return err
+	}
+	u, err := rec.Decode()
+	if err != nil {
+		return err
+	}
+	var created any
+	if !u.CreatedAt.IsZero() {
+		created = u.CreatedAt.UTC().Format(time.RFC3339)
+	}
+	_, err = tx.Exec(`
+		INSERT INTO stargazer_profile
+			(login, name, email, company, blog, location, bio, twitter,
+			 followers, public_repos, created_at, account_type, fetched_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(login) DO UPDATE SET
+			name = excluded.name, email = excluded.email, company = excluded.company,
+			blog = excluded.blog, location = excluded.location, bio = excluded.bio,
+			twitter = excluded.twitter, followers = excluded.followers,
+			public_repos = excluded.public_repos, created_at = excluded.created_at,
+			account_type = excluded.account_type, fetched_at = excluded.fetched_at`,
+		login, nullable(u.Name), nullable(u.Email), nullable(u.Company),
+		nullable(u.Blog), nullable(u.Location), nullable(u.Bio), nullable(u.Twitter),
+		u.Followers, u.PublicRepos, created, nullable(u.Type),
+		rec.FetchedAt.UTC().Format(time.RFC3339))
+	if err != nil {
+		return fmt.Errorf("upserting profile for %s: %w", login, err)
+	}
+	return nil
+}
+
+// nullable maps an unset profile field to SQL NULL. GitHub returns an absent
+// field as null and the decoder turns that into "", and the difference matters
+// downstream: "has no public email" has to be a condition a query can express
+// without also matching an account whose email is the empty string.
+func nullable(s string) any {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	return strings.TrimSpace(s)
 }
 
 // markBackfilled records that a self-dating history was captured up to this

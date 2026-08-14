@@ -116,6 +116,30 @@ CREATE TABLE IF NOT EXISTS stargazer (
   starred_at TEXT NOT NULL
 );
 
+-- The public profile of a stargazer, as GitHub shows it to any signed-in
+-- reader. Every column is opt-in profile data the account chose to publish;
+-- most are NULL for most people, email above all.
+--
+-- Separate from stargazer rather than columns on it, because the two are
+-- captured by different crawls at different prices: the star list is one
+-- paginated walk over the whole repository, a profile is one request per
+-- account. A missing row here means "not fetched", never "no such account".
+CREATE TABLE IF NOT EXISTS stargazer_profile (
+  login        TEXT PRIMARY KEY,
+  name         TEXT,
+  email        TEXT,
+  company      TEXT,
+  blog         TEXT,
+  location     TEXT,
+  bio          TEXT,
+  twitter      TEXT,
+  followers    INTEGER,
+  public_repos INTEGER,
+  created_at   TEXT,            -- when the account was created, RFC3339 UTC
+  account_type TEXT,            -- User | Organization | Bot
+  fetched_at   TEXT NOT NULL    -- when the profile was last read, RFC3339 UTC
+);
+
 -- Fork history. Like stargazer, every row dates itself, so one backfill is
 -- complete rather than sampled.
 CREATE TABLE IF NOT EXISTS fork (
