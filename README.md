@@ -360,6 +360,20 @@ derived and never needs committing.
 > the numbers in the gifs above come from a synthetic dataset rather than a real
 > archive.
 
+**`raw/users/` is the exception, and it is not a close call.** Those files are other
+people's names, locations, companies and email addresses. The argument that justifies
+committing the rest of the archive does not reach them: traffic data is irreplaceable
+after 14 days, whereas a profile can be fetched again at any moment for one request. So
+there is nothing there to back up, and a great deal to publish by accident. Ignore it:
+
+```gitignore
+data/raw/users/
+```
+
+`backfill-users` refills it in a single run. The per-snapshot `stargazers.json` is a
+milder case — it holds logins and avatar URLs, no names or addresses — but it is still a
+list of people, so it is worth a thought before a tracking repository goes public.
+
 ## Querying it directly
 
 ```sh
