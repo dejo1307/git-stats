@@ -61,7 +61,7 @@ func usage() {
 
 usage:
   git-stats collect [-env FILE] [-repo R] [-data DIR] [-stars] [-forks] [-users] [-track PATHS]
-  git-stats report  [-env FILE] [-repo R] [-since 30d] [-per-day] [-html FILE]
+  git-stats report  [-env FILE] [-repo R] [-since 30d] [-per-day] [-html FILE] [-contacts]
   git-stats stargazers [-with-email] [-name RE] [-email RE] [-company RE] [-location RE]
                        [-forked] [-people] [-since 30d] [-limit N] [-format table|csv|emails]
   git-stats rebuild [-env FILE] [-repo R] [-data DIR]
@@ -76,7 +76,10 @@ usage:
 
 commands:
   collect         snapshot every available endpoint into the archive and database
-  report          summarise trends (terminal, or -html for a dashboard)
+  report          summarise trends (terminal, or -html for a dashboard). -contacts adds
+                  the stargazer list to the dashboard — searchable and paginated, 25
+                  rows at a time. Opt-in, because it turns a file about download counts
+                  into one holding other people's names and addresses.
   stargazers      list who starred, with whatever public profile was fetched. Every
                   pattern is a case-insensitive regexp and they AND together, so
                   -location berlin -with-email is one list. -format emails prints
@@ -384,8 +387,15 @@ func runReport(args []string) error {
 	since := fs.String("since", "", "limit deltas to a trailing window, e.g. 30d or 12h")
 	perDay := fs.Bool("per-day", false, "also show deltas normalised to a daily rate")
 	html := fs.String("html", "", "write a self-contained HTML dashboard to this file")
+	contacts := fs.Bool("contacts", false,
+		"add the stargazer list to the dashboard (-html only); it holds personal data")
+	maxContacts := fs.Int("max-contacts", 0,
+		"cap the embedded stargazer list, newest first; 0 uses the default of 2000")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *contacts && *html == "" {
+		return errors.New("-contacts adds a section to the dashboard, so it needs -html FILE")
 	}
 	repo, err := resolveRepo(*repoArg)
 	if err != nil {
@@ -403,12 +413,26 @@ func runReport(args []string) error {
 	}
 	defer db.Close()
 
-	opts := report.Options{Repo: repo, Since: window, PerDay: *perDay}
+	opts := report.Options{
+		Repo: repo, Since: window, PerDay: *perDay,
+		Contacts: *contacts, MaxContacts: *maxContacts,
+	}
 	if *html != "" {
 		if err := report.HTMLFile(*html, db, opts); err != nil {
 			return err
 		}
 		fmt.Printf("wrote %s\n", *html)
+		if *contacts {
+			// Worth one line: this file was a chart of download counts and is
+			// now also a contact list, and it is the artefact most likely to be
+			// mailed on or dropped in a shared folder.
+			coverage, err := db.ProfileCoverage()
+			if err != nil {
+				return err
+			}
+			fmt.Printf("note: it holds %d public profile(s), %d with an email address. "+
+				"Treat it as personal data.\n", coverage.Profiles, coverage.WithEmail)
+		}
 		return nil
 	}
 	return report.Text(os.Stdout, db, opts)

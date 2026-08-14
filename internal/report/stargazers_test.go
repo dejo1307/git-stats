@@ -236,7 +236,7 @@ func TestStargazersSaysWhenProfilesAreMissing(t *testing.T) {
 	}
 
 	none := stargazerDB(t, fixture{login: "ada", daysAgo: 1})
-	if got := run(t, none, report.StargazerOptions{}); !strings.Contains(got, "No profiles fetched") {
+	if got := run(t, none, report.StargazerOptions{}); !strings.Contains(got, "No profiles have been fetched") {
 		t.Errorf("an unfetched list is not called out:\n%s", got)
 	}
 

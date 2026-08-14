@@ -186,7 +186,7 @@ and can be caught up at any time; traffic cannot.
 
 ```
 git-stats collect [-repo R] [-data DIR] [-stars] [-forks] [-users] [-track PATHS]
-git-stats report  [-repo R] [-since 30d] [-per-day] [-html FILE]
+git-stats report  [-repo R] [-since 30d] [-per-day] [-html FILE] [-contacts] [-max-contacts N]
 git-stats stargazers [-with-email] [-name RE] [-email RE] [-company RE] [-location RE]
                      [-forked] [-people] [-since 30d] [-limit N] [-format table|csv|emails]
 git-stats rebuild [-repo R] [-data DIR]
@@ -285,6 +285,30 @@ one person — with no header or count, so it pipes straight into whatever sends
 The footer always says how much of the star list has actually been looked up. A short
 contact list has two very different causes — a crawl that has not finished, and
 stargazers who publish nothing — and only the first is worth another `backfill-users`.
+
+### In the dashboard
+
+```sh
+git-stats report -html stats.html -contacts
+```
+
+Adds a **Who starred this** section: the same list, searchable, with *only with an email*
+and *only forkers* toggles, sortable by date, account or follower count, and paginated at
+25 rows a page. Only those 25 rows are ever in the DOM, so a repository with thousands of
+stargazers gets a section of a page rather than a page that is nothing else.
+
+It is opt-in for a reason. Everything else the dashboard shows is a number about your own
+project; this is other people's names and addresses, in the one file most likely to be
+mailed to somebody or dropped in a shared folder. `report` prints a line saying how many
+profiles and addresses went in. `-max-contacts` caps the embedded list — it defaults to
+the 2000 most recent stars, about 120 bytes of JSON each, and the page says when it
+truncated rather than quietly presenting a partial list as the whole one.
+
+Two details worth knowing. An account that has never been looked up is tagged *not
+fetched*, so a row of dashes cannot be misread as somebody who publishes nothing — the
+distinction the whole list turns on. And the table needs JavaScript, since it paginates
+in the browser; without it the section points at `git-stats stargazers`, which does the
+same job and filters better.
 
 > GitHub's Acceptable Use Policies, §7: *"You may not use information from the Service
 > (whether scraped, collected through our API, or obtained otherwise) for spamming

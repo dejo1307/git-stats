@@ -2,7 +2,9 @@ package report
 
 import (
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
+	"html/template"
 	"io"
 	"regexp"
 	"strconv"
@@ -136,6 +138,126 @@ func matches(re *regexp.Regexp, candidates ...string) bool {
 		}
 	}
 	return false
+}
+
+// contactRow is one stargazer as the dashboard embeds it.
+//
+// Every optional field is omitted when empty rather than written as "". Most
+// people publish almost nothing, so on a real list that is most of the bytes —
+// which is what keeps a page holding thousands of stargazers small enough to
+// open from disk.
+type contactRow struct {
+	Login     string `json:"login"`
+	Starred   string `json:"starred"`
+	Name      string `json:"name,omitempty"`
+	Email     string `json:"email,omitempty"`
+	Company   string `json:"company,omitempty"`
+	Location  string `json:"location,omitempty"`
+	Blog      string `json:"blog,omitempty"`
+	Twitter   string `json:"twitter,omitempty"`
+	Followers int64  `json:"followers,omitempty"`
+	Forked    bool   `json:"forked,omitempty"`
+	// Kind marks an account that is not a person. "User" is the overwhelming
+	// majority and is left out; an Organization or Bot is worth flagging,
+	// because neither has an opinion about the software.
+	Kind string `json:"kind,omitempty"`
+	// Unfetched marks a star whose account has never been looked up. Without
+	// it, such a row is a line of dashes indistinguishable from an account
+	// that was fetched and publishes nothing — and the two call for opposite
+	// conclusions: one is a gap in the crawl, the other is the answer.
+	Unfetched bool `json:"unfetched,omitempty"`
+}
+
+// contactData is the stargazer list and what has to be said about it.
+type contactData struct {
+	Rows []contactRow
+	// Total is how many stargazers exist, which differs from len(Rows) when
+	// the cap truncated the list.
+	Total     int
+	Withheld  int
+	Coverage  store.ProfileCoverage
+	WithEmail int
+}
+
+// buildContacts assembles the stargazer list for the dashboard, newest first.
+func buildContacts(db *store.DB, opts Options) (contactData, error) {
+	var d contactData
+
+	all, err := db.Stargazers()
+	if err != nil {
+		return d, err
+	}
+	if d.Coverage, err = db.ProfileCoverage(); err != nil {
+		return d, err
+	}
+	d.Total = len(all)
+
+	limit := opts.MaxContacts
+	if limit <= 0 {
+		limit = defaultMaxContacts
+	}
+	if len(all) > limit {
+		// Newest first already, so truncating keeps the recent stars — the ones
+		// worth asking, since they starred something they have just seen.
+		d.Withheld = len(all) - limit
+		all = all[:limit]
+	}
+
+	d.Rows = make([]contactRow, 0, len(all))
+	for _, r := range all {
+		row := contactRow{
+			Login: r.Login, Starred: r.StarredAt.Format("2006-01-02"),
+			Name: r.Name, Email: r.Email, Company: r.Company,
+			Location: r.Location, Blog: r.Blog, Twitter: r.Twitter,
+			Followers: r.Followers, Forked: r.Forked, Unfetched: !r.HasProfile,
+		}
+		if r.AccountType != "" && r.AccountType != "User" {
+			row.Kind = r.AccountType
+		}
+		if r.Email != "" {
+			d.WithEmail++
+		}
+		d.Rows = append(d.Rows, row)
+	}
+	return d, nil
+}
+
+// JSON renders the rows for embedding.
+//
+// template.JS rather than template.HTML: the value lands inside a script
+// element, where the escaper works in JavaScript context and would otherwise
+// render the whole array as one quoted string literal.
+//
+// Marking it trusted is safe because encoding/json escapes <, > and & as
+// <, > and &, so no value in here — a display name somebody
+// chose, say — can close the script element it sits inside. The page reads it
+// back with JSON.parse and writes every cell with textContent, so nothing in
+// it is ever interpreted as markup either.
+func (d contactData) JSON() (template.JS, error) {
+	if d.Rows == nil {
+		d.Rows = []contactRow{}
+	}
+	raw, err := json.Marshal(d.Rows)
+	if err != nil {
+		return "", err
+	}
+	return template.JS(raw), nil //nolint:gosec // escaped above; see the doc comment
+}
+
+// Caption is the paragraph above the table: what the list is, how much of it
+// has been looked up, and what it is not licence to do.
+func (d contactData) Caption() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d stargazer(s)", d.Coverage.Stars)
+	if d.Withheld > 0 {
+		fmt.Fprintf(&b, ", of which the %d most recent are listed here", len(d.Rows))
+	}
+	b.WriteString(". ")
+	b.WriteString(coverageLine(d.Coverage))
+	b.WriteString(" Everything shown is what GitHub displays to any signed-in visitor " +
+		"on the profile page — nothing is inferred, and commit author addresses are " +
+		"deliberately not collected.")
+	return b.String()
 }
 
 // Stargazers writes the filtered stargazer list.
@@ -274,15 +396,18 @@ func writeStargazerTable(w io.Writer, shown, matched []store.StargazerRow,
 // When the crawl is complete it says so without repeating the address count
 // the caller has already printed: the only thing left to explain is that the
 // missing addresses are not missing from the archive but from GitHub.
+//
+// No backticks: this same sentence is also the dashboard's caption, where a
+// markdown quoting convention would render as the literal character.
 func coverageLine(c store.ProfileCoverage) string {
 	switch {
 	case c.Profiles == 0:
-		return "No profiles fetched yet, so every name and email is blank. " +
-			"Run `git-stats backfill-users`."
+		return "No profiles have been fetched yet, so every name and email is blank. " +
+			"Run git-stats backfill-users."
 	case c.Profiles < c.Stars:
 		return fmt.Sprintf(
 			"Only %d of %d profiles have been fetched, so this list is partial. Run "+
-				"`git-stats backfill-users` again for the rest — it resumes where it stopped.",
+				"git-stats backfill-users again for the rest — it resumes where it stopped.",
 			c.Profiles, c.Stars)
 	default:
 		return "All profiles fetched. The accounts without an address publish none: " +
