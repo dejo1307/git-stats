@@ -187,6 +187,8 @@ and can be caught up at any time; traffic cannot.
 ```
 git-stats collect [-repo R] [-data DIR] [-stars] [-forks] [-users] [-track PATHS]
 git-stats report  [-repo R] [-since 30d] [-per-day] [-html FILE]
+git-stats stargazers [-with-email] [-name RE] [-email RE] [-company RE] [-location RE]
+                     [-forked] [-people] [-since 30d] [-limit N] [-format table|csv|emails]
 git-stats rebuild [-repo R] [-data DIR]
 git-stats backfill [-repo R] [-data DIR]
 git-stats backfill-stars [-repo R] [-data DIR]
@@ -199,6 +201,7 @@ Every command also takes `-env FILE` to read configuration from a named file —
 
 - `report -html stats.html` writes a self-contained dashboard — no external requests,
   works opened straight from disk, light and dark.
+- `stargazers` lists who starred, with whatever profile has been fetched. See below.
 - `rebuild` deletes the database and replays the whole archive into a new one. It
   takes `-repo` even though it fetches nothing, because replaying re-derives the
   per-platform columns from asset filenames.
@@ -241,6 +244,47 @@ Three limits are worth knowing before running it:
 Everything collected is what GitHub shows any signed-in visitor on the profile page.
 Nothing is inferred, and commit author addresses — which people frequently never meant to
 publish — are deliberately not touched.
+
+### Reading the list back
+
+```sh
+git-stats stargazers                              # everyone, newest star first
+git-stats stargazers -location berlin -with-email # who is nearby and reachable
+git-stats stargazers -forked -people              # starred and forked, no orgs or bots
+git-stats stargazers -since 30d -format csv > new-stars.csv
+git-stats stargazers -with-email -format emails | pbcopy
+```
+
+```
+starred     login       name             email                company    location
+2026-08-12  jrivera     Jordan Rivera    —                    —          Lisbon
+2026-08-09  sam-okafor* Samira Okafor    samira@example.org   @acme      Berlin
+2026-08-08  kestrel-dev Kestrel          —                    —          —
+
+3 of 47 stargazer(s) match; 1 publishes an email.
+Only 12 of 47 profiles have been fetched, so this list is partial. Run
+`git-stats backfill-users` again for the rest — it resumes where it stopped.
+* also forked the repository.
+```
+
+Those names are invented, like `acme/widget` above. A README is the wrong place for
+somebody's real address.
+
+`-name`, `-email`, `-company` and `-location` are regular expressions, matched
+case-insensitively, and they AND together. `-name` also matches the login, which is the
+one name every account has. A pattern on a profile field is also a filter for having one:
+`-company .*` lists the accounts that publish a company rather than all of them. An
+asterisk marks an account that also forked the repository — free to know, since the fork
+list is already collected, and a good deal more telling than a star on its own.
+
+The three formats are for three different things. `table` is for reading. `csv` carries
+every column, for a spreadsheet or a mail merge that addresses people by name. `emails`
+prints bare addresses, one per line and deduplicated — one person with two accounts is
+one person — with no header or count, so it pipes straight into whatever sends the mail.
+
+The footer always says how much of the star list has actually been looked up. A short
+contact list has two very different causes — a crawl that has not finished, and
+stargazers who publish nothing — and only the first is worth another `backfill-users`.
 
 > GitHub's Acceptable Use Policies, §7: *"You may not use information from the Service
 > (whether scraped, collected through our API, or obtained otherwise) for spamming

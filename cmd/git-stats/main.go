@@ -62,6 +62,8 @@ func usage() {
 usage:
   git-stats collect [-env FILE] [-repo R] [-data DIR] [-stars] [-forks] [-users] [-track PATHS]
   git-stats report  [-env FILE] [-repo R] [-since 30d] [-per-day] [-html FILE]
+  git-stats stargazers [-with-email] [-name RE] [-email RE] [-company RE] [-location RE]
+                       [-forked] [-people] [-since 30d] [-limit N] [-format table|csv|emails]
   git-stats rebuild [-env FILE] [-repo R] [-data DIR]
   git-stats backfill [-env FILE] [-repo R] [-data DIR]
   git-stats backfill-stars [-env FILE] [-repo R] [-data DIR]
@@ -75,6 +77,11 @@ usage:
 commands:
   collect         snapshot every available endpoint into the archive and database
   report          summarise trends (terminal, or -html for a dashboard)
+  stargazers      list who starred, with whatever public profile was fetched. Every
+                  pattern is a case-insensitive regexp and they AND together, so
+                  -location berlin -with-email is one list. -format emails prints
+                  bare addresses, deduplicated, for piping somewhere else.
+                  Needs backfill-users to have run, or every name is blank.
   rebuild         discard the database and replay the whole archive into a new one
   backfill        fetch every history that dates itself — stars, forks, the diff size
                   of each tracked commit, and each stargazer's public profile.
@@ -138,6 +145,8 @@ func run(args []string) error {
 			backfill{Stars: true, Forks: true, CommitDetails: true, Users: true}, env)
 	case "report":
 		return runReport(args[1:])
+	case "stargazers":
+		return runStargazers(args[1:])
 	case "rebuild":
 		return runRebuild(args[1:])
 	case "version", "-version", "--version":
@@ -403,6 +412,49 @@ func runReport(args []string) error {
 		return nil
 	}
 	return report.Text(os.Stdout, db, opts)
+}
+
+// runStargazers lists who starred the repository, filtered.
+//
+// Separate from `report` rather than a section of it: a report is a summary
+// somebody reads, while this is a list somebody pipes. Folding it in would
+// mean either printing a contact list every time anyone asks for download
+// trends, or burying it behind a flag on a command whose output is prose.
+func runStargazers(args []string) error {
+	fs := flag.NewFlagSet("stargazers", flag.ContinueOnError)
+	envFlag(fs)
+	data := dataDirFlag(fs)
+	name := fs.String("name", "", "keep accounts whose name or login matches this regexp")
+	email := fs.String("email", "", "keep accounts whose public email matches this regexp")
+	company := fs.String("company", "", "keep accounts whose company matches this regexp")
+	location := fs.String("location", "", "keep accounts whose location matches this regexp")
+	withEmail := fs.Bool("with-email", false, "keep only accounts that publish an email")
+	forked := fs.Bool("forked", false, "keep only accounts that also forked the repository")
+	people := fs.Bool("people", false, "drop organisations and bots")
+	since := fs.String("since", "", "keep only stars given inside a trailing window, e.g. 30d")
+	limit := fs.Int("limit", 0, "stop after this many rows; 0 is all of them")
+	format := fs.String("format", report.FormatTable,
+		"table, csv, or emails for bare addresses one per line")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	window, err := parseDuration("-since", *since)
+	if err != nil {
+		return err
+	}
+
+	db, err := store.Open(store.DBPath(*data))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	return report.Stargazers(os.Stdout, db, report.StargazerOptions{
+		Name: *name, Email: *email, Company: *company, Location: *location,
+		WithEmail: *withEmail, Forked: *forked, People: *people,
+		Since: window, Limit: *limit, Format: *format,
+	})
 }
 
 func runRebuild(args []string) error {
