@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"os"
@@ -8,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/dejo1307/git-stats/internal/github"
 )
 
 // dirLayout is an RFC3339-shaped, filesystem-safe timestamp for archive
@@ -36,6 +39,12 @@ const (
 	// forever. It sits inside the archive root, which List ignores because its
 	// name is not a timestamp.
 	commitCacheSubdir = "commits"
+
+	// userCacheSubdir holds one stargazer profile per file, shared across
+	// snapshots for the same reason the commit cache is. A profile is not
+	// immutable the way a commit is, so these records carry a fetch time and an
+	// ETag and are revalidated rather than trusted forever.
+	userCacheSubdir = "users"
 )
 
 // Archive is the append-only directory of raw API responses.
@@ -139,6 +148,53 @@ func (s Snapshot) ReadCommitDetail(sha string) (raw []byte, found bool, err erro
 		return nil, false, err
 	}
 	return raw, true, nil
+}
+
+// UserPath is where one account's archived profile record lives.
+//
+// The login is checked rather than escaped: GitHub logins are letters, digits
+// and hyphens only, so anything else did not come from the API and has no
+// business being turned into a path.
+func (s Snapshot) UserPath(login string) (string, error) {
+	if !github.ValidLogin(login) {
+		return "", fmt.Errorf("invalid login %q", login)
+	}
+	return filepath.Join(s.Root, userCacheSubdir, login+".json"), nil
+}
+
+// WriteUser caches one account's profile record for every snapshot to use.
+func (s Snapshot) WriteUser(login string, raw []byte) error {
+	path, err := s.UserPath(login)
+	if err != nil {
+		return err
+	}
+	if err := ensureDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		return fmt.Errorf("writing %s: %w", path, err)
+	}
+	return nil
+}
+
+// ReadUser returns a cached profile record. found is false when the account has
+// not been fetched, which is the normal state until `backfill-users` runs.
+func (s Snapshot) ReadUser(login string) (rec github.UserRecord, found bool, err error) {
+	path, err := s.UserPath(login)
+	if err != nil {
+		return rec, false, err
+	}
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return rec, false, nil
+	}
+	if err != nil {
+		return rec, false, err
+	}
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		return rec, false, fmt.Errorf("decoding %s: %w", path, err)
+	}
+	return rec, true, nil
 }
 
 // Write stores one raw response verbatim.

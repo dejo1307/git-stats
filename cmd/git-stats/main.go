@@ -60,11 +60,14 @@ func usage() {
 	fmt.Fprint(os.Stderr, `git-stats — GitHub distribution metrics over time
 
 usage:
-  git-stats collect [-env FILE] [-repo R] [-data DIR] [-stars] [-forks] [-track PATHS]
-  git-stats report  [-env FILE] [-repo R] [-since 30d] [-per-day] [-html FILE]
+  git-stats collect [-env FILE] [-repo R] [-data DIR] [-stars] [-forks] [-users] [-track PATHS]
+  git-stats report  [-env FILE] [-repo R] [-since 30d] [-per-day] [-html FILE] [-contacts]
+  git-stats stargazers [-with-email] [-name RE] [-email RE] [-company RE] [-location RE]
+                       [-forked] [-people] [-since 30d] [-limit N] [-format table|csv|emails]
   git-stats rebuild [-env FILE] [-repo R] [-data DIR]
   git-stats backfill [-env FILE] [-repo R] [-data DIR]
   git-stats backfill-stars [-env FILE] [-repo R] [-data DIR]
+  git-stats backfill-users [-env FILE] [-repo R] [-data DIR] [-user-refresh 30d]
   git-stats version
 
   -env names a configuration file instead of searching for .env, which is how one
@@ -73,12 +76,26 @@ usage:
 
 commands:
   collect         snapshot every available endpoint into the archive and database
-  report          summarise trends (terminal, or -html for a dashboard)
+  report          summarise trends (terminal, or -html for a dashboard). -contacts adds
+                  the stargazer list to the dashboard — searchable and paginated, 25
+                  rows at a time. Opt-in, because it turns a file about download counts
+                  into one holding other people's names and addresses.
+  stargazers      list who starred, with whatever public profile was fetched. Every
+                  pattern is a case-insensitive regexp and they AND together, so
+                  -location berlin -with-email is one list. -format emails prints
+                  bare addresses, deduplicated, for piping somewhere else.
+                  Needs backfill-users to have run, or every name is blank.
   rebuild         discard the database and replay the whole archive into a new one
-  backfill        fetch every history that dates itself — stars, forks, and the diff
-                  size of each tracked commit. Complete back to the first commit and
-                  worth running once; the per-commit half is cached forever after.
+  backfill        fetch every history that dates itself — stars, forks, the diff size
+                  of each tracked commit, and each stargazer's public profile.
+                  Complete back to the first commit and worth running once; the
+                  per-commit and per-account halves are cached forever after.
   backfill-stars  the star history alone
+  backfill-users  the stargazer profiles alone — one request per account against an
+                  hourly budget of 5000, so a large repository takes several runs.
+                  Each is cached, so a later run resumes rather than starting over.
+                  Only works on repositories you own: GitHub refuses the stargazer
+                  list for everyone else's.
 
 environment:
   GIT_STATS_REPO          repository to track, as owner/name. Required; -repo overrides it.
@@ -124,11 +141,15 @@ func run(args []string) error {
 		return runCollect(ctx, args[1:], backfill{}, env)
 	case "backfill-stars":
 		return runCollect(ctx, args[1:], backfill{Stars: true}, env)
+	case "backfill-users":
+		return runCollect(ctx, args[1:], backfill{Users: true}, env)
 	case "backfill":
 		return runCollect(ctx, args[1:],
-			backfill{Stars: true, Forks: true, CommitDetails: true}, env)
+			backfill{Stars: true, Forks: true, CommitDetails: true, Users: true}, env)
 	case "report":
 		return runReport(args[1:])
+	case "stargazers":
+		return runStargazers(args[1:])
 	case "rebuild":
 		return runRebuild(args[1:])
 	case "version", "-version", "--version":
@@ -259,6 +280,7 @@ type backfill struct {
 	Stars         bool
 	Forks         bool
 	CommitDetails bool
+	Users         bool
 }
 
 // trackPaths returns the repository paths whose commit history is captured.
@@ -287,6 +309,13 @@ func runCollect(ctx context.Context, args []string, force backfill, env dotenv.L
 	forks := fs.Bool("forks", false, "also backfill the full fork history")
 	details := fs.Bool("commit-details", false,
 		"also fetch each tracked commit's diff size (one request per commit, cached)")
+	users := fs.Bool("users", false,
+		"also fetch each stargazer's public profile (one request per account, cached; implies -stars)")
+	// A string rather than a flag.Duration, so this takes the same "30d"
+	// spelling -since does. Days are the unit anyone reaches for here, and Go's
+	// own duration syntax has no suffix for them.
+	userRefresh := fs.String("user-refresh", "",
+		"re-check cached profiles older than this, e.g. 30d; empty fetches only the ones never fetched")
 	track := fs.String("track", strings.Join(trackPaths(), ","),
 		"comma-separated paths whose commit history is captured")
 	if err := fs.Parse(args); err != nil {
@@ -297,6 +326,11 @@ func runCollect(ctx context.Context, args []string, force backfill, env dotenv.L
 		return err
 	}
 	warnSharedDataDir(fs, args, *data)
+
+	refresh, err := parseDuration("-user-refresh", *userRefresh)
+	if err != nil {
+		return err
+	}
 
 	var paths []string
 	for _, p := range strings.Split(*track, ",") {
@@ -315,6 +349,8 @@ func runCollect(ctx context.Context, args []string, force backfill, env dotenv.L
 		Stars:         *stars || force.Stars,
 		Forks:         *forks || force.Forks,
 		CommitDetails: *details || force.CommitDetails,
+		Users:         *users || force.Users,
+		UserRefresh:   refresh,
 		TrackPaths:    paths,
 		Log:           os.Stdout,
 	}
@@ -351,15 +387,22 @@ func runReport(args []string) error {
 	since := fs.String("since", "", "limit deltas to a trailing window, e.g. 30d or 12h")
 	perDay := fs.Bool("per-day", false, "also show deltas normalised to a daily rate")
 	html := fs.String("html", "", "write a self-contained HTML dashboard to this file")
+	contacts := fs.Bool("contacts", false,
+		"add the stargazer list to the dashboard (-html only); it holds personal data")
+	maxContacts := fs.Int("max-contacts", 0,
+		"cap the embedded stargazer list, newest first; 0 uses the default of 2000")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *contacts && *html == "" {
+		return errors.New("-contacts adds a section to the dashboard, so it needs -html FILE")
 	}
 	repo, err := resolveRepo(*repoArg)
 	if err != nil {
 		return err
 	}
 
-	window, err := parseDuration(*since)
+	window, err := parseDuration("-since", *since)
 	if err != nil {
 		return err
 	}
@@ -370,15 +413,72 @@ func runReport(args []string) error {
 	}
 	defer db.Close()
 
-	opts := report.Options{Repo: repo, Since: window, PerDay: *perDay}
+	opts := report.Options{
+		Repo: repo, Since: window, PerDay: *perDay,
+		Contacts: *contacts, MaxContacts: *maxContacts,
+	}
 	if *html != "" {
 		if err := report.HTMLFile(*html, db, opts); err != nil {
 			return err
 		}
 		fmt.Printf("wrote %s\n", *html)
+		if *contacts {
+			// Worth one line: this file was a chart of download counts and is
+			// now also a contact list, and it is the artefact most likely to be
+			// mailed on or dropped in a shared folder.
+			coverage, err := db.ProfileCoverage()
+			if err != nil {
+				return err
+			}
+			fmt.Printf("note: it holds %d public profile(s), %d with an email address. "+
+				"Treat it as personal data.\n", coverage.Profiles, coverage.WithEmail)
+		}
 		return nil
 	}
 	return report.Text(os.Stdout, db, opts)
+}
+
+// runStargazers lists who starred the repository, filtered.
+//
+// Separate from `report` rather than a section of it: a report is a summary
+// somebody reads, while this is a list somebody pipes. Folding it in would
+// mean either printing a contact list every time anyone asks for download
+// trends, or burying it behind a flag on a command whose output is prose.
+func runStargazers(args []string) error {
+	fs := flag.NewFlagSet("stargazers", flag.ContinueOnError)
+	envFlag(fs)
+	data := dataDirFlag(fs)
+	name := fs.String("name", "", "keep accounts whose name or login matches this regexp")
+	email := fs.String("email", "", "keep accounts whose public email matches this regexp")
+	company := fs.String("company", "", "keep accounts whose company matches this regexp")
+	location := fs.String("location", "", "keep accounts whose location matches this regexp")
+	withEmail := fs.Bool("with-email", false, "keep only accounts that publish an email")
+	forked := fs.Bool("forked", false, "keep only accounts that also forked the repository")
+	people := fs.Bool("people", false, "drop organisations and bots")
+	since := fs.String("since", "", "keep only stars given inside a trailing window, e.g. 30d")
+	limit := fs.Int("limit", 0, "stop after this many rows; 0 is all of them")
+	format := fs.String("format", report.FormatTable,
+		"table, csv, or emails for bare addresses one per line")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	window, err := parseDuration("-since", *since)
+	if err != nil {
+		return err
+	}
+
+	db, err := store.Open(store.DBPath(*data))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	return report.Stargazers(os.Stdout, db, report.StargazerOptions{
+		Name: *name, Email: *email, Company: *company, Location: *location,
+		WithEmail: *withEmail, Forked: *forked, People: *people,
+		Since: window, Limit: *limit, Format: *format,
+	})
 }
 
 func runRebuild(args []string) error {
@@ -405,8 +505,10 @@ func runRebuild(args []string) error {
 }
 
 // parseDuration accepts Go durations plus a "d" suffix for days, which is the
-// natural unit for a window measured in snapshots.
-func parseDuration(s string) (time.Duration, error) {
+// natural unit for both a window measured in snapshots and a cache lifetime.
+// flag names the option in the error, since Go's own duration syntax rejects
+// the "30d" spelling a reader would reach for first.
+func parseDuration(flag, s string) (time.Duration, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return 0, nil
@@ -414,13 +516,13 @@ func parseDuration(s string) (time.Duration, error) {
 	if days, ok := strings.CutSuffix(s, "d"); ok {
 		n, err := strconv.ParseFloat(days, 64)
 		if err != nil {
-			return 0, fmt.Errorf("invalid -since %q: %w", s, err)
+			return 0, fmt.Errorf("invalid %s %q: %w", flag, s, err)
 		}
 		return time.Duration(n * float64(24*time.Hour)), nil
 	}
 	d, err := time.ParseDuration(s)
 	if err != nil {
-		return 0, fmt.Errorf("invalid -since %q: %w", s, err)
+		return 0, fmt.Errorf("invalid %s %q: %w", flag, s, err)
 	}
 	return d, nil
 }

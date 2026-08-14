@@ -90,6 +90,13 @@ type htmlData struct {
 	Withdrawn      string
 	TrackedPaths   string
 	EventsCounted  string
+
+	// The stargazer list, present only with Options.Contacts.
+	HasContacts     bool
+	Contacts        template.JS
+	ContactCaption  string
+	ContactCount    int
+	ContactWithMail int
 }
 
 func buildHTML(db *store.DB, opts Options) (htmlData, error) {
@@ -308,6 +315,20 @@ func buildHTML(db *store.DB, opts Options) (htmlData, error) {
 		}
 	}
 
+	if opts.Contacts {
+		contacts, err := buildContacts(db, opts)
+		if err != nil {
+			return d, err
+		}
+		if d.Contacts, err = contacts.JSON(); err != nil {
+			return d, err
+		}
+		d.HasContacts = true
+		d.ContactCaption = contacts.Caption()
+		d.ContactCount = len(contacts.Rows)
+		d.ContactWithMail = contacts.WithEmail
+	}
+
 	d.Notes = notes(d, win)
 	return d, nil
 }
@@ -342,6 +363,19 @@ func notes(d htmlData, win windowSummary) []string {
 				"history, so those can be compared over the whole life of the project. Views, "+
 				"clones and download counters only exist from the first collection onward, so "+
 				"for anything older the event is dated but its effect on them is unknowable.")
+	}
+	if d.HasContacts {
+		out = append(out,
+			"The stargazer list is opt-in public profile data — the name, company, location and "+
+				"email each account chose to display to any signed-in visitor. Most people set none "+
+				"of it, so a mostly empty table means most stargazers publish nothing, not that "+
+				"anything failed. Commit author addresses, which are also reachable and which people "+
+				"frequently never meant to publish, are deliberately not collected.",
+			"This file now holds other people's personal data. GitHub's Acceptable Use Policies "+
+				"forbid using information from the service for spamming purposes, including sending "+
+				"unsolicited email, and in the EU unsolicited commercial email to individuals needs "+
+				"prior consent. Asking a few users what they make of something they starred is not "+
+				"that; mailing the list is.")
 	}
 	out = append(out,
 		"Install scripts and self-updaters fetch an artifact and its checksum together, so the "+
@@ -526,6 +560,29 @@ var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!doctype htm
          border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px;
          font-size: 12.5px; box-shadow: 0 4px 14px rgba(0,0,0,.16); z-index: 10; }
   #tip .t { color: var(--text-secondary); display: block; font-size: 11.5px; }
+  /* Stargazer list. Left-aligned throughout except the follower count: these
+     are names and places, and right-aligning them would rag the wrong edge. */
+  .contacts td, .contacts th { text-align: left; }
+  .contacts td.num, .contacts th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .contacts a { color: var(--series-1); text-decoration: none; }
+  .contacts a:hover { text-decoration: underline; }
+  .contacts .none { color: var(--muted); }
+  .contacts .tag { font-size: 11px; color: var(--muted); border: 1px solid var(--border);
+                   border-radius: 4px; padding: 0 4px; margin-left: 4px; }
+  .sg-controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 0 0 12px; }
+  .sg-controls input[type=search] { flex: 1 1 220px; min-width: 160px; font: inherit;
+    font-size: 13.5px; padding: 6px 10px; border-radius: 8px; color: var(--text-primary);
+    background: var(--page); border: 1px solid var(--border); }
+  .sg-controls label { font-size: 13px; color: var(--text-secondary);
+    display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+  .sg-sortable { cursor: pointer; user-select: none; }
+  .sg-sortable:hover { color: var(--text-primary); }
+  .sg-pager { display: flex; gap: 10px; align-items: center; justify-content: flex-end;
+    margin-top: 12px; font-size: 13px; color: var(--text-secondary); }
+  .sg-pager button { font: inherit; font-size: 13px; padding: 4px 12px; cursor: pointer;
+    background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: 999px; }
+  .sg-pager button[disabled] { opacity: .4; cursor: default; }
   #theme { position: fixed; top: 16px; right: 16px; background: var(--surface-1);
            color: var(--text-secondary); border: 1px solid var(--border);
            border-radius: 999px; padding: 6px 14px; font-size: 12.5px; cursor: pointer;
@@ -686,6 +743,41 @@ var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!doctype htm
   </figure>
   {{end}}
 
+  {{if .HasContacts}}
+  <figure class="contacts">
+    <h2>Who starred this</h2>
+    <p class="caption">{{.ContactCaption}}</p>
+    <div class="sg-controls">
+      <input type="search" id="sg-q" placeholder="Filter by name, login, email, company or location"
+             aria-label="Filter stargazers">
+      <label><input type="checkbox" id="sg-mail"> only with an email</label>
+      <label><input type="checkbox" id="sg-fork"> only forkers</label>
+    </div>
+    <table>
+      <thead><tr>
+        <th class="sg-sortable" data-sort="starred">Starred</th>
+        <th class="sg-sortable" data-sort="login">Account</th>
+        <th>Email</th><th>Company</th><th>Location</th>
+        <th class="num sg-sortable" data-sort="followers">Followers</th>
+      </tr></thead>
+      <tbody id="sg-rows"></tbody>
+    </table>
+    <div class="sg-pager">
+      <span id="sg-count"></span>
+      <button type="button" id="sg-prev">Previous</button>
+      <span id="sg-page"></span>
+      <button type="button" id="sg-next">Next</button>
+    </div>
+    <noscript>
+      <p class="empty">This table is paginated in the browser, so it needs JavaScript.
+        The same list is available from the terminal, where it also filters:
+        <code>git-stats stargazers -with-email</code>, or
+        <code>-format emails</code> for addresses alone.</p>
+    </noscript>
+  </figure>
+  <script type="application/json" id="sg-data">{{.Contacts}}</script>
+  {{end}}
+
   <details>
     <summary>Platform table</summary>
     <table>
@@ -730,6 +822,142 @@ var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!doctype htm
   });
 })();
 </script>
+{{if .HasContacts}}
+<script>
+// Stargazer table: filter, sort and paginate in the page.
+//
+// Paginated rather than printed in full because the list can run to thousands
+// of people, and a table that long is not a section of a page — it is the page,
+// with everything else pushed past the end of the scrollbar. Only the current
+// 25 rows are ever in the DOM.
+//
+// Every cell is written with textContent and every href is assembled from
+// encoded components. The strings here are display names and company fields
+// chosen by other people, so building this markup by concatenation would let
+// one of them run script inside a file the maintainer opens from disk.
+(function () {
+  const rows = JSON.parse(document.getElementById('sg-data').textContent);
+  const body = document.getElementById('sg-rows');
+  const PAGE = 25;
+  let query = '', mailOnly = false, forkOnly = false, sort = 'starred', dir = -1, page = 0;
+
+  const haystack = r => [r.login, r.name, r.email, r.company, r.location]
+    .filter(Boolean).join(' ').toLowerCase();
+
+  function selected() {
+    return rows.filter(r =>
+      (!mailOnly || r.email) && (!forkOnly || r.forked) &&
+      (!query || haystack(r).indexOf(query) !== -1));
+  }
+
+  function ordered(list) {
+    return list.slice().sort((a, b) => {
+      const x = a[sort] || (sort === 'followers' ? 0 : ''),
+            y = b[sort] || (sort === 'followers' ? 0 : '');
+      return (x < y ? -1 : x > y ? 1 : 0) * dir;
+    });
+  }
+
+  function cell(row, text, muted) {
+    const td = document.createElement('td');
+    td.textContent = text || '—';
+    if (!text || muted) td.className = 'none';
+    row.appendChild(td);
+    return td;
+  }
+
+  function link(td, href, text) {
+    td.textContent = '';
+    const a = document.createElement('a');
+    a.href = href;
+    a.textContent = text;
+    a.rel = 'noopener noreferrer';
+    td.appendChild(a);
+  }
+
+  function render() {
+    const matching = ordered(selected());
+    const pages = Math.max(1, Math.ceil(matching.length / PAGE));
+    if (page >= pages) page = pages - 1;
+    if (page < 0) page = 0;
+
+    body.textContent = '';
+    for (const r of matching.slice(page * PAGE, page * PAGE + PAGE)) {
+      const tr = document.createElement('tr');
+      cell(tr, r.starred);
+
+      const account = cell(tr, r.name || r.login);
+      link(account, 'https://github.com/' + encodeURIComponent(r.login), r.name || r.login);
+      if (r.name) {
+        const login = document.createElement('span');
+        login.className = 'tag';
+        login.textContent = r.login;
+        account.appendChild(login);
+      }
+      // "not fetched" is not the same as "publishes nothing", and without the
+      // tag both are a row of dashes.
+      for (const [flag, label] of
+           [[r.forked, 'forked'], [r.kind, r.kind], [r.unfetched, 'not fetched']]) {
+        if (!flag) continue;
+        const tag = document.createElement('span');
+        tag.className = 'tag';
+        tag.textContent = label;
+        account.appendChild(tag);
+      }
+
+      const mail = cell(tr, r.email);
+      if (r.email) link(mail, 'mailto:' + encodeURIComponent(r.email), r.email);
+      cell(tr, r.company);
+      cell(tr, r.location);
+      const followers = cell(tr, r.followers ? String(r.followers) : '');
+      followers.className = r.followers ? 'num' : 'num none';
+
+      body.appendChild(tr);
+    }
+
+    // Say which column the order is coming from; a table that silently
+    // reordered itself on a click is worse than one that cannot sort.
+    for (const th of document.querySelectorAll('.sg-sortable')) {
+      const label = th.dataset.label || (th.dataset.label = th.textContent);
+      th.textContent = th.dataset.sort === sort ? label + (dir < 0 ? ' ▾' : ' ▴') : label;
+    }
+
+    const withMail = matching.filter(r => r.email).length;
+    document.getElementById('sg-count').textContent =
+      matching.length + ' shown, ' + withMail + ' with an email';
+    document.getElementById('sg-page').textContent = (page + 1) + ' / ' + pages;
+    document.getElementById('sg-prev').disabled = page === 0;
+    document.getElementById('sg-next').disabled = page >= pages - 1;
+  }
+
+  document.getElementById('sg-q').addEventListener('input', function (e) {
+    query = e.target.value.trim().toLowerCase();
+    page = 0;
+    render();
+  });
+  for (const [id, set] of [['sg-mail', v => mailOnly = v], ['sg-fork', v => forkOnly = v]]) {
+    document.getElementById(id).addEventListener('change', function (e) {
+      set(e.target.checked);
+      page = 0;
+      render();
+    });
+  }
+  document.getElementById('sg-prev').addEventListener('click', () => { page--; render(); });
+  document.getElementById('sg-next').addEventListener('click', () => { page++; render(); });
+  for (const th of document.querySelectorAll('.sg-sortable')) {
+    th.addEventListener('click', function () {
+      const key = th.dataset.sort;
+      dir = sort === key ? -dir : (key === 'login' ? 1 : -1);
+      sort = key;
+      page = 0;
+      render();
+    });
+  }
+
+  render();
+})();
+</script>
+{{end}}
 </body>
 </html>
 `))

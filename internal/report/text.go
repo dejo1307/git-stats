@@ -23,7 +23,23 @@ type Options struct {
 	PerDay bool
 	// Now is the reference time for Since; zero means time.Now.
 	Now time.Time
+
+	// Contacts adds the stargazer list to the HTML dashboard. Opt-in, because
+	// it turns a file about download counts into a file holding other people's
+	// names and addresses — and the dashboard is the artefact most likely to be
+	// mailed to somebody or dropped in a shared folder.
+	Contacts bool
+	// MaxContacts caps how many stargazers are embedded. Zero means
+	// defaultMaxContacts. The page says when it truncated.
+	MaxContacts int
 }
+
+// defaultMaxContacts bounds the embedded list. A row costs about 120 bytes of
+// JSON — measured, not guessed — so this holds the list itself to a quarter of
+// a megabyte on a repository with more stars than anyone is going to read
+// through. The cap keeps the newest stars, which are the ones worth asking:
+// they starred something they have just seen.
+const defaultMaxContacts = 2000
 
 func (o Options) now() time.Time {
 	if o.Now.IsZero() {
