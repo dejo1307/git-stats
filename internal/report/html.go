@@ -59,11 +59,14 @@ type htmlData struct {
 	Cumulative   template.HTML
 	Platforms    template.HTML
 	PlatformRows []row
-	Views        template.HTML
-	Clones       template.HTML
-	Stars        template.HTML
-	StarsDaily   template.HTML
-	Forks        template.HTML
+	// Other counts downloads of assets that are not platform binaries, so the
+	// reader can see where the totals exceed the sum of the platform rows.
+	Other      int64
+	Views      template.HTML
+	Clones     template.HTML
+	Stars      template.HTML
+	StarsDaily template.HTML
+	Forks      template.HTML
 	// Coverage strings state the period each series spans, which is not the
 	// same as when the snapshots were taken.
 	ViewsCoverage  string
@@ -201,7 +204,10 @@ func buildHTML(db *store.DB, opts Options) (htmlData, error) {
 	}
 	d.Cumulative = MarkedLineChart(pts, "--series-1", "downloads", marks)
 
-	// Platform breakdown.
+	// Platform breakdown. Assets that are not platform binaries get a row of
+	// their own rather than a bar: they are real downloads, but downloading
+	// one installs nothing.
+	d.Other = totals.Other
 	platformKeys := sortedKeys(totals.ByPlatform)
 	bars := make([]Bar, 0, len(platformKeys))
 	for _, p := range platformKeys {
@@ -212,6 +218,11 @@ func buildHTML(db *store.DB, opts Options) (htmlData, error) {
 		bars = append(bars, Bar{Label: p, Value: float64(totals.ByPlatform[p]), Note: note})
 		d.PlatformRows = append(d.PlatformRows, row{Cells: []string{
 			p, formatNum(float64(totals.ByPlatform[p])), fmt.Sprintf("%+d", win.ByPlatform[p]),
+		}})
+	}
+	if totals.Other > 0 {
+		d.PlatformRows = append(d.PlatformRows, row{Cells: []string{
+			"other (not installs)", formatNum(float64(totals.Other)), fmt.Sprintf("%+d", win.Other),
 		}})
 	}
 	d.Platforms = BarChart(bars, []string{"--series-1", "--series-2", "--series-3", "--series-4"})
@@ -376,6 +387,14 @@ func notes(d htmlData, win windowSummary) []string {
 				"unsolicited email, and in the EU unsolicited commercial email to individuals needs "+
 				"prior consent. Asking a few users what they make of something they starred is not "+
 				"that; mailing the list is.")
+	}
+	if d.Other > 0 {
+		out = append(out, fmt.Sprintf(
+			"%s of the downloads did not come from a platform binary. Assets whose name carries "+
+				"no os-arch — release manifests, source archives — are real downloads but not "+
+				"installs: they count in the totals and appear as 'other' in the platform table, "+
+				"but get no bar of their own.",
+			formatNum(float64(d.Other))))
 	}
 	out = append(out,
 		"Install scripts and self-updaters fetch an artifact and its checksum together, so the "+

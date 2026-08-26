@@ -1,6 +1,12 @@
 package report
 
-import "testing"
+import (
+	"bytes"
+	"strings"
+	"testing"
+
+	"github.com/dejo1307/git-stats/internal/store"
+)
 
 func TestSparkline(t *testing.T) {
 	tests := []struct {
@@ -55,5 +61,34 @@ func TestAddThousands(t *testing.T) {
 		if got := addThousands(tt.in); got != tt.want {
 			t.Errorf("addThousands(%q) = %q, want %q", tt.in, got, tt.want)
 		}
+	}
+}
+
+func TestWritePlatformsShowsOtherAssets(t *testing.T) {
+	totals := store.Totals{
+		Total:      25,
+		Other:      9,
+		ByPlatform: map[string]int64{"darwin-arm64": 16},
+	}
+	win := windowSummary{Total: 10, Other: 4, Days: 2, ByPlatform: map[string]int64{"darwin-arm64": 6}}
+
+	var buf bytes.Buffer
+	if err := writePlatforms(&buf, totals, win, Options{}); err != nil {
+		t.Fatalf("writePlatforms: %v", err)
+	}
+	for _, want := range []string{"darwin-arm64", "other (not installs)", "TOTAL"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("platform table is missing %q:\n%s", want, buf.String())
+		}
+	}
+
+	totals.Other = 0
+	win.Other = 0
+	buf.Reset()
+	if err := writePlatforms(&buf, totals, win, Options{}); err != nil {
+		t.Fatalf("writePlatforms: %v", err)
+	}
+	if strings.Contains(buf.String(), "other (not installs)") {
+		t.Errorf("an empty other bucket was rendered:\n%s", buf.String())
 	}
 }

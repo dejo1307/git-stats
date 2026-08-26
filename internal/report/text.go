@@ -178,6 +178,7 @@ func filterSince(intervals []store.Interval, opts Options) []store.Interval {
 // windowSummary is the aggregate of every interval in the reporting window.
 type windowSummary struct {
 	Total      int64
+	Other      int64 // the part of Total that did not come from a platform binary
 	Days       float64
 	From, To   time.Time
 	ByPlatform map[string]int64
@@ -196,6 +197,7 @@ func sumIntervals(intervals []store.Interval) windowSummary {
 		}
 		w.To = iv.To
 		w.Total += iv.Total
+		w.Other += iv.Other
 		w.Days += iv.Days
 		for k, v := range iv.ByPlatform {
 			w.ByPlatform[k] += v
@@ -226,6 +228,17 @@ func writePlatforms(w io.Writer, totals store.Totals, win windowSummary, opts Op
 			row += fmt.Sprintf("\t%+d", win.ByPlatform[p])
 			if showRate {
 				row += fmt.Sprintf("\t%.1f", perDay(win.ByPlatform[p], win.Days))
+			}
+		}
+		fmt.Fprintln(tw, row)
+	}
+
+	if totals.Other > 0 {
+		row := fmt.Sprintf("  %s\t%d", "other (not installs)", totals.Other)
+		if !win.Empty {
+			row += fmt.Sprintf("\t%+d", win.Other)
+			if showRate {
+				row += fmt.Sprintf("\t%.1f", perDay(win.Other, win.Days))
 			}
 		}
 		fmt.Fprintln(tw, row)

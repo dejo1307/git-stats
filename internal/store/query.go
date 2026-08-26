@@ -99,7 +99,9 @@ func (db *DB) assetRows() ([]assetRow, error) {
 		if err := rows.Scan(&r.snapshotID, &r.assetID, &r.tag, &r.version, &os, &arch, &r.kind, &r.count); err != nil {
 			return nil, err
 		}
-		r.platform = "unknown"
+		// An empty platform is not a missing value: any os-arch pair parses, so
+		// an asset that did not is not a platform binary at all (a manifest, a
+		// source tarball). Callers route it to Other rather than guessing.
 		if os != "" && arch != "" {
 			r.platform = os + "-" + arch
 		}
@@ -115,9 +117,14 @@ func (db *DB) assetRows() ([]assetRow, error) {
 // different over one day than over three weeks. Never render Total as a daily
 // rate without dividing by Days.
 type Interval struct {
-	From, To   time.Time
-	Days       float64
-	Total      int64
+	From, To time.Time
+	Days     float64
+	Total    int64
+	// Other is the part of Total that did not come from a platform binary:
+	// assets whose name does not carry an os-arch, such as release manifests.
+	// They are real downloads but not installs, so they get a column of their
+	// own instead of masquerading as a platform.
+	Other      int64
 	ByPlatform map[string]int64
 	ByKind     map[string]int64
 	ByVersion  map[string]int64
@@ -210,7 +217,11 @@ func (db *DB) Intervals() ([]Interval, error) {
 			}
 			iv := &intervals[idx-1]
 			iv.Total += delta
-			iv.ByPlatform[cur.platform] += delta
+			if cur.platform == "" {
+				iv.Other += delta
+			} else {
+				iv.ByPlatform[cur.platform] += delta
+			}
 			iv.ByKind[cur.kind] += delta
 			iv.ByVersion[cur.version] += delta
 		}
@@ -220,8 +231,13 @@ func (db *DB) Intervals() ([]Interval, error) {
 
 // Totals is the cumulative all-time picture at one snapshot.
 type Totals struct {
-	TakenAt    time.Time
-	Total      int64
+	TakenAt time.Time
+	Total   int64
+	// Other is the part of Total that did not come from a platform binary:
+	// assets whose name does not carry an os-arch, such as release manifests.
+	// They are real downloads but not installs, so they get a column of their
+	// own instead of masquerading as a platform.
+	Other      int64
 	ByPlatform map[string]int64
 	ByKind     map[string]int64
 	ByRelease  []ReleaseTotal
@@ -241,8 +257,10 @@ type ReleaseTotal struct {
 // download in their own right.
 var checksumKinds = []string{"sha256", "sha512"}
 
-// Archives is all-time downloads of release artifacts, excluding checksums.
-func (t Totals) Archives() int64 { return t.Total - t.Checksums() }
+// Archives is all-time downloads of release artifacts, excluding checksums
+// and other non-install assets. Both are fetched without installing anything:
+// a checksum verifies an artifact, and a manifest merely describes one.
+func (t Totals) Archives() int64 { return t.Total - t.Checksums() - t.Other }
 
 // Checksums is all-time downloads of checksum files. Install scripts and
 // self-updaters fetch one alongside every artifact; browsers and plain curl
@@ -283,12 +301,13 @@ func (db *DB) LatestTotals() (Totals, error) {
 		if err := rows.Scan(&os, &arch, &kind, &sum); err != nil {
 			return Totals{}, err
 		}
-		platform := "unknown"
-		if os != "" && arch != "" {
-			platform = os + "-" + arch
-		}
 		t.Total += sum
-		t.ByPlatform[platform] += sum
+		if os != "" && arch != "" {
+			t.ByPlatform[os+"-"+arch] += sum
+		} else {
+			// No os-arch in the name: a real download, not an install.
+			t.Other += sum
+		}
 		t.ByKind[kind] += sum
 	}
 	if err := rows.Err(); err != nil {

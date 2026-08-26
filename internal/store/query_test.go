@@ -119,6 +119,56 @@ func TestIntervalsSplitByPlatformAndKind(t *testing.T) {
 	}
 }
 
+func TestNonInstallAssetsAreNotPlatforms(t *testing.T) {
+	dir := t.TempDir()
+	releases := func(binary, manifest int64) string {
+		return `[{"tag_name":"v1.0.0","assets":[
+			{"id":1,"name":"widget-1.0.0-darwin-arm64.tar.gz","download_count":` + itoa(binary) + `,"size":1,"created_at":"2026-01-01T00:00:00Z"},
+			{"id":2,"name":"version.json","download_count":` + itoa(manifest) + `,"size":1,"created_at":"2026-01-01T00:00:00Z"}]}]`
+	}
+	snapshotAt(t, dir, day(1), map[string]string{FileReleases: releases(10, 5)})
+	snapshotAt(t, dir, day(2), map[string]string{FileReleases: releases(16, 9)})
+
+	db := openDB(t, dir)
+	intervals, err := db.Intervals()
+	if err != nil {
+		t.Fatalf("Intervals: %v", err)
+	}
+	iv := intervals[0]
+	if iv.ByPlatform["darwin-arm64"] != 6 {
+		t.Errorf("darwin-arm64 delta = %d, want 6", iv.ByPlatform["darwin-arm64"])
+	}
+	if _, ok := iv.ByPlatform["unknown"]; ok {
+		t.Errorf("a non-install asset was charted as a platform: %v", iv.ByPlatform)
+	}
+	if iv.Other != 4 {
+		t.Errorf("other delta = %d, want 4 (the manifest's growth)", iv.Other)
+	}
+	if iv.Total != 10 {
+		t.Errorf("interval total = %d, want 10 (6 binary + 4 manifest)", iv.Total)
+	}
+
+	totals, err := db.LatestTotals()
+	if err != nil {
+		t.Fatalf("LatestTotals: %v", err)
+	}
+	if totals.ByPlatform["darwin-arm64"] != 16 {
+		t.Errorf("darwin-arm64 total = %d, want 16", totals.ByPlatform["darwin-arm64"])
+	}
+	if _, ok := totals.ByPlatform["unknown"]; ok {
+		t.Errorf("a non-install asset was charted as a platform: %v", totals.ByPlatform)
+	}
+	if totals.Other != 9 {
+		t.Errorf("other total = %d, want 9", totals.Other)
+	}
+	if totals.Total != 25 {
+		t.Errorf("all-time total = %d, want 25 (manifests are downloads too)", totals.Total)
+	}
+	if got := totals.Archives(); got != 16 {
+		t.Errorf("Archives = %d, want 16 (a manifest is not an install)", got)
+	}
+}
+
 func TestFailedSnapshotIsNotTreatedAsZero(t *testing.T) {
 	dir := t.TempDir()
 	snapshotAt(t, dir, day(1), map[string]string{
