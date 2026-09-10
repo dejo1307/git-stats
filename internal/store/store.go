@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS asset_count (
   asset_name     TEXT    NOT NULL,
   os             TEXT,                -- darwin | linux | windows, NULL if unparsed
   arch           TEXT,                -- amd64 | arm64
-  kind           TEXT,                -- tar.gz | sha256
+  kind           TEXT,                -- tar.gz | sha256 | upgrade.sha256
   download_count INTEGER NOT NULL,
   size           INTEGER NOT NULL,
   created_at     TEXT    NOT NULL,

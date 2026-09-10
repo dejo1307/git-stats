@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -105,8 +106,13 @@ func TestIntervalsSplitByPlatformAndKind(t *testing.T) {
 		t.Fatalf("Intervals: %v", err)
 	}
 	iv := intervals[0]
-	if iv.ByPlatform["darwin-arm64"] != 9 {
-		t.Errorf("darwin-arm64 delta = %d, want 9", iv.ByPlatform["darwin-arm64"])
+	// Artifacts alone: counting the checksum per platform would count each
+	// scripted install twice.
+	if iv.ByPlatform["darwin-arm64"] != 6 {
+		t.Errorf("darwin-arm64 delta = %d, want 6", iv.ByPlatform["darwin-arm64"])
+	}
+	if iv.Checksums != 3 {
+		t.Errorf("checksum delta = %d, want 3", iv.Checksums)
 	}
 	if iv.ByPlatform["linux-amd64"] != 0 {
 		t.Errorf("linux-amd64 delta = %d, want 0", iv.ByPlatform["linux-amd64"])
@@ -257,6 +263,107 @@ func TestCumulativeTracksEverySnapshot(t *testing.T) {
 	}
 	if len(points) != 2 || points[0].Total != 100 || points[1].Total != 130 {
 		t.Errorf("cumulative series = %+v, want totals 100 then 130", points)
+	}
+}
+
+func TestSplitMix(t *testing.T) {
+	tests := []struct {
+		name                          string
+		artifacts, installs, upgrades int64
+		want                          Mix
+	}{
+		{"every kind of client", 10, 6, 3, Mix{Upgrades: 3, Scripted: 6, Manual: 1}},
+		{"no checksums means manual", 4, 0, 0, Mix{Manual: 4}},
+		// A mirror or scanner fetching checksums alone must not invent installs.
+		{"checksums without artifacts", 0, 5, 2, Mix{}},
+		{"install checksums capped by what upgrades left", 5, 5, 3, Mix{Upgrades: 3, Scripted: 2}},
+	}
+	for _, tt := range tests {
+		if got := splitMix(tt.artifacts, tt.installs, tt.upgrades); got != tt.want {
+			t.Errorf("%s: splitMix(%d, %d, %d) = %+v, want %+v",
+				tt.name, tt.artifacts, tt.installs, tt.upgrades, got, tt.want)
+		}
+	}
+}
+
+// assetJSON is one release asset as the GitHub API reports it.
+func assetJSON(id int64, name string, count int64) string {
+	return fmt.Sprintf(`{"id":%d,"name":%q,"download_count":%d,"size":1,"created_at":"2026-01-01T00:00:00Z"}`,
+		id, name, count)
+}
+
+// TestInstallMixPairsWithinReleaseAndPlatform pins the grain of the split.
+//
+// v0.9.0 has five checksum fetches against one artifact, the shape a scanner
+// leaves. Paired across all releases, those spare checksums would turn
+// v1.0.0's browser downloads into scripted installs, and the totals below would
+// read 11 scripted instead of 7.
+func TestInstallMixPairsWithinReleaseAndPlatform(t *testing.T) {
+	dir := t.TempDir()
+	releases := func(darwinTar, darwinUpgrade int64) string {
+		return `[{"tag_name":"v1.0.0","assets":[` +
+			assetJSON(1, "widget-1.0.0-darwin-arm64.tar.gz", darwinTar) + "," +
+			assetJSON(2, "widget-1.0.0-darwin-arm64.sha256", 6) + "," +
+			assetJSON(3, "widget-1.0.0-darwin-arm64.upgrade.sha256", darwinUpgrade) + "," +
+			assetJSON(4, "widget-1.0.0-linux-amd64.tar.gz", 4) + "," +
+			assetJSON(5, "widget-1.0.0-linux-amd64.sha256", 0) + "," +
+			assetJSON(6, "version.json", 20) + `]},` +
+			`{"tag_name":"v0.9.0","assets":[` +
+			assetJSON(7, "widget-0.9.0-linux-amd64.tar.gz", 1) + "," +
+			assetJSON(8, "widget-0.9.0-linux-amd64.sha256", 5) + `]}]`
+	}
+	snapshotAt(t, dir, day(1), map[string]string{FileReleases: releases(10, 3)})
+	// Two upgrades in between, each fetching the artifact and the updater's checksum.
+	snapshotAt(t, dir, day(2), map[string]string{FileReleases: releases(12, 5)})
+
+	db := openDB(t, dir)
+	totals, err := db.LatestTotals()
+	if err != nil {
+		t.Fatalf("LatestTotals: %v", err)
+	}
+	if !totals.PublishesUpgradeChecksum() {
+		t.Error("an upgrade checksum is published but was not recognised")
+	}
+	if want := (Mix{Upgrades: 5, Scripted: 7, Manual: 5}); totals.Mix != want {
+		t.Errorf("mix = %+v, want %+v", totals.Mix, want)
+	}
+	if got := totals.Mix.Total(); got != totals.Archives() || got != 17 {
+		t.Errorf("mix covers %d artifacts, Archives = %d, want both 17", got, totals.Archives())
+	}
+	if got := totals.ByPlatform["darwin-arm64"]; got != 12 {
+		t.Errorf("darwin-arm64 = %d, want 12 (artifacts alone, no checksums)", got)
+	}
+	if want := (Mix{Scripted: 1, Manual: 4}); totals.MixByPlatform["linux-amd64"] != want {
+		t.Errorf("linux-amd64 mix = %+v, want %+v", totals.MixByPlatform["linux-amd64"], want)
+	}
+
+	var v1 *ReleaseTotal
+	for i := range totals.ByRelease {
+		if totals.ByRelease[i].Tag == "v1.0.0" {
+			v1 = &totals.ByRelease[i]
+		}
+	}
+	if v1 == nil {
+		t.Fatal("v1.0.0 missing from ByRelease")
+	}
+	if v1.Total != 47 || v1.Archives != 16 {
+		t.Errorf("v1.0.0 total/archives = %d/%d, want 47/16 (the manifest is a download, not an artifact)",
+			v1.Total, v1.Archives)
+	}
+	if want := (Mix{Upgrades: 5, Scripted: 6, Manual: 5}); v1.Mix != want {
+		t.Errorf("v1.0.0 mix = %+v, want %+v", v1.Mix, want)
+	}
+
+	intervals, err := db.Intervals()
+	if err != nil {
+		t.Fatalf("Intervals: %v", err)
+	}
+	iv := intervals[0]
+	if want := (Mix{Upgrades: 2}); iv.Mix != want {
+		t.Errorf("interval mix = %+v, want %+v", iv.Mix, want)
+	}
+	if iv.Checksums != 2 || iv.ByPlatform["darwin-arm64"] != 2 {
+		t.Errorf("interval checksums/darwin = %d/%d, want 2/2", iv.Checksums, iv.ByPlatform["darwin-arm64"])
 	}
 }
 

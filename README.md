@@ -134,12 +134,18 @@ The per-platform breakdown comes from asset filenames, which GoReleaser and
 hand-rolled release workflows converge on:
 
 ```
-<prefix>-<version>-<goos>-<goarch>.<tar.gz|tgz|tar.xz|tar.bz2|zip|sha256|sha512>
+<prefix>-<version>-<goos>-<goarch>.<tar.gz|tgz|tar.xz|tar.bz2|zip|sha256|sha512|upgrade.sha256>
 ```
 
 The prefix defaults to the repository name, so `owner/widget` publishing
 `widget-1.2.3-darwin-arm64.tar.gz` needs no configuration. Set
 `GIT_STATS_ASSET_PREFIX` if your project publishes under a different name.
+
+A checksum per artifact is what lets the report estimate how each download was made:
+an install script fetches the artifact and its `.sha256`, a browser only the artifact.
+A self-updater looks exactly like an install script unless it fetches a checksum of its
+own. Publish a copy of each checksum as `widget-1.2.3-darwin-arm64.upgrade.sha256` (same
+digest, different name), point the updater at it, and upgrades get a column of their own.
 
 Assets that do not match are **still counted** — their downloads land in the totals,
 just without an OS, arch or kind. So a project with entirely different naming still
@@ -381,10 +387,11 @@ sqlite3 data/stats.db
 ```
 
 ```sql
--- Downloads per platform as of the latest snapshot
+-- Artifact downloads per platform as of the latest snapshot (checksums excluded)
 SELECT os || '-' || arch AS platform, SUM(download_count) AS total
 FROM asset_count
 WHERE snapshot_id = (SELECT MAX(id) FROM snapshot)
+  AND os IS NOT NULL AND kind NOT IN ('sha256', 'sha512', 'upgrade.sha256')
 GROUP BY platform ORDER BY total DESC;
 
 -- Growth of one release between the two most recent snapshots
@@ -493,13 +500,27 @@ linking to you. The referrer table is the only window onto that, and it covers 1
   wants it. Check that the release actually carries that asset before concluding
   anything about demand.
 - **Install scripts and self-updaters fetch an artifact and its checksum together**; a
-  browser download usually fetches only the artifact. The smaller count approximates
-  scripted installs, the excess approximates manual ones. This split only appears for
-  projects that publish a checksum per artifact.
-- **A self-update cannot be told apart from a fresh install.** A self-updater issues
-  exactly the same asset requests as a first-time install script, and GitHub's
-  `download_count` records no user agent, referrer or IP. Upgrades are therefore
-  counted, but only inside the combined "scripted" figure.
+  browser download usually fetches only the artifact. Within each release and platform,
+  artifact downloads matched by a checksum count as scripted and the excess as manual.
+  Pairing within the release matters: summed across releases, one release's stray
+  checksum fetches would pass another's browser downloads off as installs. This split
+  only appears for projects that publish a checksum per artifact.
+- **A self-update cannot be told apart from a fresh install** unless the updater fetches
+  a checksum of its own. GitHub's `download_count` records no user agent, referrer or IP,
+  so identical requests are identical counts. With an `.upgrade.sha256` per artifact (see
+  [Release asset names](#release-asset-names)) upgrades are counted on their own;
+  updaters released before it existed still count as scripted.
+- **Anything that installs your release on someone's behalf counts as scripted**, since it
+  fetches the checksum just as an install script does. A language package that downloads
+  the binary on first use is one; in CI without a cache it downloads on every run.
+- **An install script run under WSL reports Linux**, so Windows users working in WSL
+  appear under `linux-amd64`, not `windows-amd64`.
+- **Platform figures count artifacts alone.** Checksums verify an artifact and get a row
+  of their own; counting them per platform would count every scripted install twice.
+- **A quick repeat download can go uncounted.** Two downloads of the same artifact from
+  one machine seconds apart have been seen to count once, while each fetched a different
+  checksum and both checksums counted. The split is capped by the artifact count, so such
+  a pair reads as one install. Rare outside of testing.
 - **Clones and release downloads do not overlap.** They count disjoint distribution paths:
   cloning and source-level package managers fetch no release asset, while install
   scripts, self-updaters and browser downloads never clone. Clones running many times

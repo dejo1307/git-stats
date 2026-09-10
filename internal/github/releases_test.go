@@ -12,6 +12,7 @@ func TestAssetNamerParse(t *testing.T) {
 	}{
 		{"widget-0.3.6-darwin-arm64.tar.gz", true, "0.3.6", "darwin-arm64", "tar.gz"},
 		{"widget-0.3.6-darwin-arm64.sha256", true, "0.3.6", "darwin-arm64", "sha256"},
+		{"widget-0.3.6-darwin-arm64.upgrade.sha256", true, "0.3.6", "darwin-arm64", "upgrade.sha256"},
 		{"widget-0.1.40-linux-amd64.tar.gz", true, "0.1.40", "linux-amd64", "tar.gz"},
 		{"widget-1.0.0-rc1-windows-amd64.zip", true, "1.0.0-rc1", "windows-amd64", "zip"},
 		// Anything off-scheme is kept but left unclassified rather than dropped.

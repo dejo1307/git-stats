@@ -96,8 +96,11 @@ func TestRunCapturesEverything(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if totals.ByPlatform["darwin-arm64"] != 20 {
-		t.Errorf("darwin-arm64 total = %d, want 20", totals.ByPlatform["darwin-arm64"])
+	// The platform counts artifacts alone; the checksum is its own figure, so an
+	// install that fetched both counts once.
+	if totals.ByPlatform["darwin-arm64"] != 11 || totals.Checksums() != 9 {
+		t.Errorf("darwin-arm64/checksums = %d/%d, want 11/9",
+			totals.ByPlatform["darwin-arm64"], totals.Checksums())
 	}
 	if totals.ByKind["tar.gz"] != 11 || totals.ByKind["sha256"] != 9 {
 		t.Errorf("kind split = %d/%d, want 11/9", totals.ByKind["tar.gz"], totals.ByKind["sha256"])

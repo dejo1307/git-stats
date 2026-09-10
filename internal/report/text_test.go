@@ -64,6 +64,30 @@ func TestAddThousands(t *testing.T) {
 	}
 }
 
+func TestWriteInstallMixShowsUpgradesOnlyWhenPublished(t *testing.T) {
+	totals := store.Totals{
+		Total:         30,
+		ByPlatform:    map[string]int64{"darwin-arm64": 20},
+		ByKind:        map[string]int64{"tar.gz": 20, "sha256": 8, store.UpgradeChecksum: 2},
+		Mix:           store.Mix{Upgrades: 2, Scripted: 8, Manual: 10},
+		MixByPlatform: map[string]store.Mix{"darwin-arm64": {Upgrades: 2, Scripted: 8, Manual: 10}},
+	}
+	var buf bytes.Buffer
+	writeInstallMix(&buf, totals, windowSummary{Empty: true})
+	if !strings.Contains(buf.String(), "upgrades") {
+		t.Errorf("published upgrade checksum but no upgrades column:\n%s", buf.String())
+	}
+
+	// Without the updater's own checksum there is nothing to count upgrades
+	// from, and a column of zeros would read as a measurement.
+	delete(totals.ByKind, store.UpgradeChecksum)
+	buf.Reset()
+	writeInstallMix(&buf, totals, windowSummary{Empty: true})
+	if strings.Contains(buf.String(), "upgrades") {
+		t.Errorf("upgrades column shown for releases with no upgrade checksum:\n%s", buf.String())
+	}
+}
+
 func TestWritePlatformsShowsOtherAssets(t *testing.T) {
 	totals := store.Totals{
 		Total:      25,
