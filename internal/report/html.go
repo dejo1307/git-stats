@@ -59,6 +59,11 @@ type htmlData struct {
 	Cumulative   template.HTML
 	Platforms    template.HTML
 	PlatformRows []row
+	// PlatformHead and ReleaseHead are those tables' column headings, which
+	// gain install-mix columns only when the releases can support them.
+	PlatformHead []string
+	ReleaseHead  []string
+	HasUpgrades  bool
 	// Other counts downloads of assets that are not platform binaries, so the
 	// reader can see where the totals exceed the sum of the platform rows.
 	Other      int64
@@ -164,13 +169,24 @@ func buildHTML(db *store.DB, opts Options) (htmlData, error) {
 		})
 	}
 	// Only meaningful when the project publishes a checksum per artifact.
-	if archives, sums := totals.Archives(), totals.Checksums(); sums > 0 {
+	hasMix := totals.Checksums() > 0
+	d.HasUpgrades = totals.PublishesUpgradeChecksum()
+	if hasMix {
 		d.Tiles = append(d.Tiles, tile{
 			Label: "Scripted installs",
-			Value: formatNum(float64(min64(archives, sums))),
+			Value: formatNum(float64(totals.Mix.Scripted)),
 			Detail: fmt.Sprintf("checksum fetched too · %s manual",
-				formatNum(float64(maxZero(archives-sums)))),
+				formatNum(float64(totals.Mix.Manual))),
 		})
+		if d.HasUpgrades {
+			detail := "the self-updater's own checksum"
+			if !win.Empty {
+				detail = fmt.Sprintf("+%s in window · %s", formatNum(float64(win.Mix.Upgrades)), detail)
+			}
+			d.Tiles = append(d.Tiles, tile{
+				Label: "Upgrades", Value: formatNum(float64(totals.Mix.Upgrades)), Detail: detail,
+			})
+		}
 	}
 	if repoPoints, err := db.RepoHistory(); err == nil && len(repoPoints) > 0 {
 		latest := repoPoints[len(repoPoints)-1]
@@ -208,6 +224,8 @@ func buildHTML(db *store.DB, opts Options) (htmlData, error) {
 	// their own rather than a bar: they are real downloads, but downloading
 	// one installs nothing.
 	d.Other = totals.Other
+	d.PlatformHead = append([]string{"Platform", "All time", "Window"}, mixHead(hasMix, d.HasUpgrades)...)
+	noMix := make([]string, len(mixHead(hasMix, d.HasUpgrades)))
 	platformKeys := sortedKeys(totals.ByPlatform)
 	bars := make([]Bar, 0, len(platformKeys))
 	for _, p := range platformKeys {
@@ -216,14 +234,22 @@ func buildHTML(db *store.DB, opts Options) (htmlData, error) {
 			note = fmt.Sprintf("  (+%d)", delta)
 		}
 		bars = append(bars, Bar{Label: p, Value: float64(totals.ByPlatform[p]), Note: note})
-		d.PlatformRows = append(d.PlatformRows, row{Cells: []string{
-			p, formatNum(float64(totals.ByPlatform[p])), fmt.Sprintf("%+d", win.ByPlatform[p]),
-		}})
+		cells := []string{p, formatNum(float64(totals.ByPlatform[p])), fmt.Sprintf("%+d", win.ByPlatform[p])}
+		d.PlatformRows = append(d.PlatformRows, row{
+			Cells: append(cells, mixCells(totals.MixByPlatform[p], hasMix, d.HasUpgrades)...),
+		})
+	}
+	// Checksums and other assets get rows but no bars and no mix: downloading
+	// either installs nothing.
+	if sums := totals.Checksums(); sums > 0 {
+		d.PlatformRows = append(d.PlatformRows, row{Cells: append([]string{
+			"checksums (verify an artifact)", formatNum(float64(sums)), fmt.Sprintf("%+d", win.Checksums),
+		}, noMix...)})
 	}
 	if totals.Other > 0 {
-		d.PlatformRows = append(d.PlatformRows, row{Cells: []string{
+		d.PlatformRows = append(d.PlatformRows, row{Cells: append([]string{
 			"other (not installs)", formatNum(float64(totals.Other)), fmt.Sprintf("%+d", win.Other),
-		}})
+		}, noMix...)})
 	}
 	d.Platforms = BarChart(bars, []string{"--series-1", "--series-2", "--series-3", "--series-4"})
 
@@ -299,16 +325,18 @@ func buildHTML(db *store.DB, opts Options) (htmlData, error) {
 		d.Forks = MarkedLineChart(forkPts, "--series-4", "forks", marks)
 	}
 
+	d.ReleaseHead = append([]string{"Release", "Published", "Downloads", "Artifacts"},
+		mixHead(hasMix, d.HasUpgrades)...)
 	byTotal := append([]store.ReleaseTotal(nil), totals.ByRelease...)
 	sort.Slice(byTotal, func(i, j int) bool { return byTotal[i].Total > byTotal[j].Total })
 	for i, r := range byTotal {
 		if i >= 15 {
 			break
 		}
-		d.Releases = append(d.Releases, row{Cells: []string{
+		d.Releases = append(d.Releases, row{Cells: append([]string{
 			r.Tag, r.PublishedAt.Format("2006-01-02"),
 			formatNum(float64(r.Total)), formatNum(float64(r.Archives)),
-		}})
+		}, mixCells(r.Mix, hasMix, d.HasUpgrades)...)})
 	}
 
 	for _, spec := range []struct {
@@ -396,11 +424,7 @@ func notes(d htmlData, win windowSummary) []string {
 				"but get no bar of their own.",
 			formatNum(float64(d.Other))))
 	}
-	out = append(out,
-		"Install scripts and self-updaters fetch an artifact and its checksum together, so the "+
-			"smaller of the two counts approximates scripted installs and the excess artifact "+
-			"downloads approximate manual ones. Such clients issue identical requests, so "+
-			"GitHub's counters cannot tell a fresh install from a self-update.",
+	out = append(out, installMixNote(d.HasUpgrades),
 		"Source-level installs have no download counter anywhere. Clone count is the nearest "+
 			"signal but a weak one in both directions: a module or package proxy caches every "+
 			"version globally, so many installs can produce a single clone, while CI, mirrors "+
@@ -411,6 +435,51 @@ func notes(d htmlData, win windowSummary) []string {
 			"checkout is not a clone and is not counted anywhere, and an artifact download says "+
 			"nothing about whether it was ever used. These are not user counts.")
 	return out
+}
+
+// installMixNote explains how artifact downloads are split by client, and
+// whether this project's releases let upgrades be counted apart.
+func installMixNote(upgrades bool) string {
+	note := "Install scripts and self-updaters fetch an artifact and its checksum together, while a " +
+		"browser fetches the artifact alone, and so does anything that installs the release on " +
+		"someone's behalf, such as a package that downloads the binary on first use. Within each " +
+		"release and platform, artifact downloads matched by a checksum download count as scripted " +
+		"and the rest as manual. Pairing within the release keeps one release's stray checksums, " +
+		"fetched by a mirror or a scanner, from passing another's browser downloads off as installs."
+	if upgrades {
+		return note + " These releases also publish each checksum a second time as " +
+			"<artifact>.upgrade.sha256, which only the self-updater fetches, so upgrades are matched " +
+			"against that first and counted on their own. Self-updaters released before that asset " +
+			"existed still fetch the install checksum, so their upgrades remain inside scripted."
+	}
+	return note + " A self-updater issues the same requests as an install script, so upgrades are " +
+		"inside the scripted figure. Publishing a copy of each checksum as " +
+		"<artifact>.upgrade.sha256, fetched only by the updater, is what separates them."
+}
+
+// mixHead and mixCells are the install-mix columns: present only when the
+// releases publish a checksum per artifact, with an upgrades column only when
+// they publish the self-updater's own as well.
+func mixHead(hasMix, upgrades bool) []string {
+	switch {
+	case !hasMix:
+		return nil
+	case upgrades:
+		return []string{"Upgrades", "Scripted", "Manual"}
+	default:
+		return []string{"Scripted", "Manual"}
+	}
+}
+
+func mixCells(m store.Mix, hasMix, upgrades bool) []string {
+	if !hasMix {
+		return nil
+	}
+	cells := []string{formatNum(float64(m.Scripted)), formatNum(float64(m.Manual))}
+	if upgrades {
+		cells = append([]string{formatNum(float64(m.Upgrades))}, cells...)
+	}
+	return cells
 }
 
 // oldestRelease returns the publication date of the earliest release, which is
@@ -459,13 +528,6 @@ func trafficPoints(db *store.DB, metric string) ([]Point, error) {
 		pts = append(pts, Point{T: t, V: float64(day.Count)})
 	}
 	return pts, nil
-}
-
-func maxZero(v int64) int64 {
-	if v < 0 {
-		return 0
-	}
-	return v
 }
 
 var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!doctype html>
@@ -647,7 +709,8 @@ var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!doctype htm
 
   <figure>
     <h2>Downloads by platform</h2>
-    <p class="caption">All-time, with the change over the reporting window in parentheses.</p>
+    <p class="caption">All-time artifact downloads, with the change over the reporting window in
+      parentheses. Checksums are left out, so an install that fetched one counts once.</p>
     {{.Platforms}}
   </figure>
 
@@ -735,8 +798,10 @@ var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!doctype htm
   {{if .Releases}}
   <figure>
     <h2>Top releases</h2>
+    <p class="caption">Downloads counts every asset. Artifacts counts platform binaries alone,
+      leaving out checksums and assets such as release manifests, which install nothing.</p>
     <table>
-      <thead><tr><th>Release</th><th>Published</th><th>Downloads</th><th>Artifacts</th></tr></thead>
+      <thead><tr>{{range .ReleaseHead}}<th>{{.}}</th>{{end}}</tr></thead>
       <tbody>{{range .Releases}}<tr>{{range .Cells}}<td>{{.}}</td>{{end}}</tr>{{end}}</tbody>
     </table>
   </figure>
@@ -800,7 +865,7 @@ var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!doctype htm
   <details>
     <summary>Platform table</summary>
     <table>
-      <thead><tr><th>Platform</th><th>All time</th><th>Window</th></tr></thead>
+      <thead><tr>{{range .PlatformHead}}<th>{{.}}</th>{{end}}</tr></thead>
       <tbody>{{range .PlatformRows}}<tr>{{range .Cells}}<td>{{.}}</td>{{end}}</tr>{{end}}</tbody>
     </table>
   </details>

@@ -80,7 +80,7 @@ func Text(w io.Writer, db *store.DB, opts Options) error {
 	if err := writePlatforms(w, totals, window, opts); err != nil {
 		return err
 	}
-	writeInstallMix(w, totals)
+	writeInstallMix(w, totals, window)
 	writeReleases(w, totals)
 	if err := writeTraffic(w, db); err != nil {
 		return err
@@ -179,9 +179,11 @@ func filterSince(intervals []store.Interval, opts Options) []store.Interval {
 type windowSummary struct {
 	Total      int64
 	Other      int64 // the part of Total that did not come from a platform binary
+	Checksums  int64 // the part of Total that verified an artifact
 	Days       float64
 	From, To   time.Time
 	ByPlatform map[string]int64
+	Mix        store.Mix
 	Series     []int64 // per-interval totals, for the sparkline
 	Empty      bool
 }
@@ -198,6 +200,8 @@ func sumIntervals(intervals []store.Interval) windowSummary {
 		w.To = iv.To
 		w.Total += iv.Total
 		w.Other += iv.Other
+		w.Checksums += iv.Checksums
+		w.Mix.Add(iv.Mix)
 		w.Days += iv.Days
 		for k, v := range iv.ByPlatform {
 			w.ByPlatform[k] += v
@@ -228,6 +232,17 @@ func writePlatforms(w io.Writer, totals store.Totals, win windowSummary, opts Op
 			row += fmt.Sprintf("\t%+d", win.ByPlatform[p])
 			if showRate {
 				row += fmt.Sprintf("\t%.1f", perDay(win.ByPlatform[p], win.Days))
+			}
+		}
+		fmt.Fprintln(tw, row)
+	}
+
+	if sums := totals.Checksums(); sums > 0 {
+		row := fmt.Sprintf("  %s\t%d", "checksums (verify an artifact)", sums)
+		if !win.Empty {
+			row += fmt.Sprintf("\t%+d", win.Checksums)
+			if showRate {
+				row += fmt.Sprintf("\t%.1f", perDay(win.Checksums, win.Days))
 			}
 		}
 		fmt.Fprintln(tw, row)
@@ -281,29 +296,52 @@ func sparkSuffix(series []int64) string {
 	return "  " + Sparkline(series)
 }
 
-// writeInstallMix splits downloads by whether a checksum was fetched too.
-// It is only meaningful for projects that publish a checksum per artifact,
-// and prints nothing for those that do not.
-func writeInstallMix(w io.Writer, totals store.Totals) {
-	archives, sums := totals.Archives(), totals.Checksums()
-	if sums == 0 {
+// writeInstallMix splits artifact downloads by the checksum fetched alongside
+// them, paired within each release and platform. It is only meaningful for
+// projects that publish a checksum per artifact, and prints nothing for those
+// that do not.
+func writeInstallMix(w io.Writer, totals store.Totals, win windowSummary) {
+	if totals.Checksums() == 0 {
 		return
 	}
-	fmt.Fprintln(w, "install mix (all-time)")
+	upgrades := totals.PublishesUpgradeChecksum()
+	fmt.Fprintln(w, "install mix (all-time, paired within each release and platform)")
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(tw, "  artifacts\t%d\n  checksums\t%d\n", archives, sums)
-	tw.Flush()
-	// An install script or a self-updater fetches the checksum alongside the
-	// artifact, so the two counters move together. A browser or a plain curl
-	// of the artifact fetches no checksum, so the gap estimates downloads that
-	// bypassed those clients.
-	manual := archives - sums
-	if manual < 0 {
-		manual = 0
+	head := "  platform\tartifacts"
+	if upgrades {
+		head += "\tupgrades"
 	}
-	fmt.Fprintf(w, "  ≈ %d scripted (install scripts and self-updaters fetch the checksum too)\n",
-		min64(archives, sums))
-	fmt.Fprintf(w, "  ≈ %d manual (artifact fetched without its checksum)\n\n", manual)
+	fmt.Fprintln(tw, head+"\tscripted\tmanual")
+	for _, p := range sortedKeys(totals.ByPlatform) {
+		fmt.Fprintf(tw, "  %s\t%d%s\n", p, totals.ByPlatform[p], mixCols(totals.MixByPlatform[p], upgrades))
+	}
+	fmt.Fprintf(tw, "  %s\t%d%s\n", "TOTAL", totals.Archives(), mixCols(totals.Mix, upgrades))
+	tw.Flush()
+	if !win.Empty {
+		line := fmt.Sprintf("+%d scripted, +%d manual", win.Mix.Scripted, win.Mix.Manual)
+		if upgrades {
+			line = fmt.Sprintf("+%d upgrades, ", win.Mix.Upgrades) + line
+		}
+		fmt.Fprintf(w, "  over the window: %s\n", line)
+	}
+	// Each client fetches a fixed set of files, and that is all the split reads.
+	if upgrades {
+		fmt.Fprintln(w, "  upgrades: artifact with the self-updater's own checksum")
+	}
+	fmt.Fprintln(w, "  scripted: artifact with the install checksum (install scripts, wrappers,")
+	fmt.Fprintln(w, "            and self-updaters older than their own checksum)")
+	fmt.Fprintln(w, "  manual:   artifact alone, as a browser or a plain curl fetches it")
+	fmt.Fprintln(w)
+}
+
+// mixCols renders a mix as trailing tab-separated columns, with an upgrades
+// column only when the releases publish the self-updater's own checksum.
+func mixCols(m store.Mix, upgrades bool) string {
+	cols := ""
+	if upgrades {
+		cols = fmt.Sprintf("\t%d", m.Upgrades)
+	}
+	return cols + fmt.Sprintf("\t%d\t%d", m.Scripted, m.Manual)
 }
 
 func writeReleases(w io.Writer, totals store.Totals) {
@@ -313,15 +351,27 @@ func writeReleases(w io.Writer, totals store.Totals) {
 	byTotal := append([]store.ReleaseTotal(nil), totals.ByRelease...)
 	sort.Slice(byTotal, func(i, j int) bool { return byTotal[i].Total > byTotal[j].Total })
 
+	hasMix, upgrades := totals.Checksums() > 0, totals.PublishesUpgradeChecksum()
 	fmt.Fprintln(w, "top releases (all-time)")
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "  release\tpublished\tdownloads\tartifacts")
+	head := "  release\tpublished\tdownloads\tartifacts"
+	if hasMix {
+		if upgrades {
+			head += "\tupgrades"
+		}
+		head += "\tscripted\tmanual"
+	}
+	fmt.Fprintln(tw, head)
 	for i, r := range byTotal {
 		if i >= 10 {
 			break
 		}
-		fmt.Fprintf(tw, "  %s\t%s\t%d\t%d\n",
-			r.Tag, r.PublishedAt.Format("2006-01-02"), r.Total, r.Archives)
+		mix := ""
+		if hasMix {
+			mix = mixCols(r.Mix, upgrades)
+		}
+		fmt.Fprintf(tw, "  %s\t%s\t%d\t%d%s\n",
+			r.Tag, r.PublishedAt.Format("2006-01-02"), r.Total, r.Archives, mix)
 	}
 	tw.Flush()
 	if len(byTotal) > 10 {
@@ -493,11 +543,4 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n-1] + "…"
-}
-
-func min64(a, b int64) int64 {
-	if a < b {
-		return a
-	}
-	return b
 }

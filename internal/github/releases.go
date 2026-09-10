@@ -59,12 +59,13 @@ type AssetName struct {
 	Version string // "0.3.6"
 	OS      string // "darwin", "linux", "windows"
 	Arch    string // "amd64", "arm64"
-	Kind    string // "tar.gz", "zip", "sha256", …
+	Kind    string // "tar.gz", "zip", "sha256", "upgrade.sha256", …
 }
 
 // assetKinds are the extensions recognised as either a release artifact or a
-// checksum for one.
-const assetKinds = `tar\.gz|tgz|tar\.xz|tar\.bz2|zip|sha256|sha512`
+// checksum for one. upgrade.sha256 is a checksum only a self-updater fetches,
+// which is what lets its downloads be counted apart from installs.
+const assetKinds = `tar\.gz|tgz|tar\.xz|tar\.bz2|zip|upgrade\.sha256|sha256|sha512`
 
 // AssetNamer parses release asset filenames for one project.
 //

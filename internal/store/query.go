@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 )
@@ -124,10 +125,19 @@ type Interval struct {
 	// assets whose name does not carry an os-arch, such as release manifests.
 	// They are real downloads but not installs, so they get a column of their
 	// own instead of masquerading as a platform.
-	Other      int64
+	Other int64
+	// Checksums is the part of Total that verified an artifact rather than
+	// being one. It is kept out of ByPlatform, where an install that fetched
+	// both would otherwise count twice.
+	Checksums int64
+	// ByPlatform is artifact downloads alone.
 	ByPlatform map[string]int64
 	ByKind     map[string]int64
 	ByVersion  map[string]int64
+	// Mix splits the interval's artifact downloads by client. An artifact and
+	// its checksum fetched either side of a snapshot land in different
+	// intervals, so one interval's split is noisier than the all-time one.
+	Mix Mix
 }
 
 // PerDay normalises the interval's total to a daily rate.
@@ -175,7 +185,9 @@ func (db *DB) Intervals() ([]Interval, error) {
 	}
 
 	intervals := make([]Interval, len(snaps)-1)
+	cells := make([]cellMap, len(intervals))
 	for i := range intervals {
+		cells[i] = cellMap{}
 		intervals[i] = Interval{
 			From:       snaps[i].TakenAt,
 			To:         snaps[i+1].TakenAt,
@@ -217,16 +229,115 @@ func (db *DB) Intervals() ([]Interval, error) {
 			}
 			iv := &intervals[idx-1]
 			iv.Total += delta
-			if cur.platform == "" {
-				iv.Other += delta
-			} else {
-				iv.ByPlatform[cur.platform] += delta
-			}
 			iv.ByKind[cur.kind] += delta
 			iv.ByVersion[cur.version] += delta
+			switch {
+			case cur.platform == "":
+				iv.Other += delta
+				continue
+			case isChecksum(cur.kind):
+				iv.Checksums += delta
+			default:
+				iv.ByPlatform[cur.platform] += delta
+			}
+			cells[idx-1].add(cur.tag, cur.platform, cur.kind, delta)
 		}
 	}
+	for i := range intervals {
+		intervals[i].Mix = cells[i].mix()
+	}
 	return intervals, nil
+}
+
+// UpgradeChecksum is the asset kind of a checksum published under a name only a
+// self-updater fetches, <artifact>.upgrade.sha256, holding the same digest as
+// the install checksum beside it. GitHub counts downloads per asset and records
+// nothing else about a request, so a copy with its own name is the only way a
+// release's counters can tell an upgrade from a fresh install.
+const UpgradeChecksum = "upgrade.sha256"
+
+// installChecksumKinds are the checksums install scripts fetch.
+var installChecksumKinds = []string{"sha256", "sha512"}
+
+func isInstallChecksum(kind string) bool { return slices.Contains(installChecksumKinds, kind) }
+
+// isChecksum reports whether an asset kind verifies another asset rather than
+// being a download in its own right.
+func isChecksum(kind string) bool { return kind == UpgradeChecksum || isInstallChecksum(kind) }
+
+// Mix splits artifact downloads by the client that most likely made them,
+// judged by which checksum, if any, was fetched alongside.
+//
+// It is an estimate paired from counters, not a record of requests: GitHub
+// keeps no log. What makes it reasonable is that each client fetches a fixed
+// set of files. A self-updater fetches the artifact and its own checksum, an
+// install script the artifact and the install checksum, a browser the artifact
+// alone.
+type Mix struct {
+	Upgrades int64 // with the self-updater's own checksum
+	Scripted int64 // with the install checksum, including updaters older than their own
+	Manual   int64 // the artifact alone
+}
+
+// Total is the artifact downloads the mix was split from.
+func (m Mix) Total() int64 { return m.Upgrades + m.Scripted + m.Manual }
+
+// Add accumulates another mix into m.
+func (m *Mix) Add(o Mix) {
+	m.Upgrades += o.Upgrades
+	m.Scripted += o.Scripted
+	m.Manual += o.Manual
+}
+
+// splitMix estimates the mix for one release on one platform.
+//
+// Upgrades are matched first, then install checksums against what is left,
+// and the rest is manual. Each step is capped by the artifact count, so a
+// checksum fetched on its own, as a mirror or a scanner might, never becomes an
+// install.
+func splitMix(artifacts, installSums, upgradeSums int64) Mix {
+	up := min(upgradeSums, artifacts)
+	scripted := min(installSums, artifacts-up)
+	return Mix{Upgrades: up, Scripted: scripted, Manual: artifacts - up - scripted}
+}
+
+// cellKey is one release on one platform, the grain at which an artifact and
+// its checksums are paired. Pairing across a coarser grain would let one
+// release's stray checksums pass another release's browser downloads off as
+// installs.
+type cellKey struct{ tag, platform string }
+
+type cellCounts struct{ artifacts, installSums, upgradeSums int64 }
+
+func (c cellCounts) mix() Mix { return splitMix(c.artifacts, c.installSums, c.upgradeSums) }
+
+// cellMap accumulates download counters per release and platform.
+type cellMap map[cellKey]*cellCounts
+
+func (m cellMap) add(tag, platform, kind string, n int64) {
+	k := cellKey{tag, platform}
+	c := m[k]
+	if c == nil {
+		c = &cellCounts{}
+		m[k] = c
+	}
+	switch {
+	case kind == UpgradeChecksum:
+		c.upgradeSums += n
+	case isInstallChecksum(kind):
+		c.installSums += n
+	default:
+		c.artifacts += n
+	}
+}
+
+// mix is the sum of every cell's own split, never a split of the sums.
+func (m cellMap) mix() Mix {
+	var total Mix
+	for _, c := range m {
+		total.Add(c.mix())
+	}
+	return total
 }
 
 // Totals is the cumulative all-time picture at one snapshot.
@@ -237,10 +348,15 @@ type Totals struct {
 	// assets whose name does not carry an os-arch, such as release manifests.
 	// They are real downloads but not installs, so they get a column of their
 	// own instead of masquerading as a platform.
-	Other      int64
+	Other int64
+	// ByPlatform is artifact downloads alone; checksums are in ByKind.
 	ByPlatform map[string]int64
 	ByKind     map[string]int64
-	ByRelease  []ReleaseTotal
+	// Mix splits artifact downloads by client, paired within each release and
+	// platform, and MixByPlatform is the same split per platform.
+	Mix           Mix
+	MixByPlatform map[string]Mix
+	ByRelease     []ReleaseTotal
 }
 
 // ReleaseTotal is one release's all-time downloads.
@@ -248,29 +364,38 @@ type ReleaseTotal struct {
 	Tag         string
 	PublishedAt time.Time
 	Total       int64
-	// Archives excludes checksum files, which are fetched by install scripts
-	// alongside the artifact and would otherwise double-count a single install.
+	// Archives is downloads of platform artifacts alone. A checksum verifies
+	// an artifact, and an asset with no platform in its name, such as a release
+	// manifest, installs nothing, so neither is counted.
 	Archives int64
+	Mix      Mix
 }
-
-// checksumKinds are asset kinds that verify another asset rather than being a
-// download in their own right.
-var checksumKinds = []string{"sha256", "sha512"}
 
 // Archives is all-time downloads of release artifacts, excluding checksums
 // and other non-install assets. Both are fetched without installing anything:
 // a checksum verifies an artifact, and a manifest merely describes one.
 func (t Totals) Archives() int64 { return t.Total - t.Checksums() - t.Other }
 
-// Checksums is all-time downloads of checksum files. Install scripts and
-// self-updaters fetch one alongside every artifact; browsers and plain curl
-// normally do not, which is what makes the number informative.
+// Checksums is all-time downloads of checksum files, the install checksum and
+// the self-updater's own alike. Browsers and plain curl normally fetch neither,
+// which is what makes the number informative.
 func (t Totals) Checksums() int64 {
 	var sum int64
-	for _, kind := range checksumKinds {
-		sum += t.ByKind[kind]
+	for kind, n := range t.ByKind {
+		if isChecksum(kind) {
+			sum += n
+		}
 	}
 	return sum
+}
+
+// PublishesUpgradeChecksum reports whether any release carries the
+// self-updater's own checksum, even one nobody has fetched yet. Without it
+// upgrades cannot be told from installs, and a report must not print an upgrade
+// count of zero as if it had been measured.
+func (t Totals) PublishesUpgradeChecksum() bool {
+	_, ok := t.ByKind[UpgradeChecksum]
+	return ok
 }
 
 // LatestTotals returns cumulative counters as of the most recent snapshot.
@@ -282,62 +407,77 @@ func (db *DB) LatestTotals() (Totals, error) {
 	latest := snaps[len(snaps)-1]
 
 	t := Totals{
-		TakenAt:    latest.TakenAt,
-		ByPlatform: map[string]int64{},
-		ByKind:     map[string]int64{},
+		TakenAt:       latest.TakenAt,
+		ByPlatform:    map[string]int64{},
+		ByKind:        map[string]int64{},
+		MixByPlatform: map[string]Mix{},
 	}
 
+	// Grouped down to one release, platform and kind, because that is the grain
+	// the install mix pairs at; every coarser figure is summed from it here.
 	rows, err := db.Query(`
-		SELECT COALESCE(os, ''), COALESCE(arch, ''), COALESCE(kind, ''), SUM(download_count)
+		SELECT release_tag, COALESCE(os, ''), COALESCE(arch, ''), COALESCE(kind, ''),
+		       SUM(download_count), MIN(created_at)
 		FROM asset_count WHERE snapshot_id = ?
-		GROUP BY os, arch, kind`, latest.ID)
+		GROUP BY release_tag, os, arch, kind`, latest.ID)
 	if err != nil {
 		return Totals{}, err
 	}
 	defer rows.Close()
+
+	releases := map[string]*ReleaseTotal{}
+	cells := cellMap{}
 	for rows.Next() {
-		var os, arch, kind string
+		var tag, os, arch, kind, created string
 		var sum int64
-		if err := rows.Scan(&os, &arch, &kind, &sum); err != nil {
+		if err := rows.Scan(&tag, &os, &arch, &kind, &sum, &created); err != nil {
 			return Totals{}, err
 		}
+		rel := releases[tag]
+		if rel == nil {
+			rel = &ReleaseTotal{Tag: tag}
+			releases[tag] = rel
+		}
+		if at, _ := time.Parse(time.RFC3339, created); !at.IsZero() &&
+			(rel.PublishedAt.IsZero() || at.Before(rel.PublishedAt)) {
+			rel.PublishedAt = at
+		}
+		rel.Total += sum
 		t.Total += sum
-		if os != "" && arch != "" {
-			t.ByPlatform[os+"-"+arch] += sum
-		} else {
+		t.ByKind[kind] += sum
+		if os == "" || arch == "" {
 			// No os-arch in the name: a real download, not an install.
 			t.Other += sum
+			continue
 		}
-		t.ByKind[kind] += sum
+		platform := os + "-" + arch
+		if !isChecksum(kind) {
+			t.ByPlatform[platform] += sum
+			rel.Archives += sum
+		}
+		cells.add(tag, platform, kind, sum)
 	}
 	if err := rows.Err(); err != nil {
 		return Totals{}, err
 	}
 
-	relRows, err := db.Query(`
-		SELECT release_tag, MIN(created_at), SUM(download_count),
-		       SUM(CASE WHEN COALESCE(kind, '') IN ('sha256', 'sha512')
-		                THEN 0 ELSE download_count END)
-		FROM asset_count WHERE snapshot_id = ?
-		GROUP BY release_tag`, latest.ID)
-	if err != nil {
-		return Totals{}, err
+	for key, c := range cells {
+		m := c.mix()
+		t.Mix.Add(m)
+		p := t.MixByPlatform[key.platform]
+		p.Add(m)
+		t.MixByPlatform[key.platform] = p
+		releases[key.tag].Mix.Add(m)
 	}
-	defer relRows.Close()
-	for relRows.Next() {
-		var r ReleaseTotal
-		var created string
-		if err := relRows.Scan(&r.Tag, &created, &r.Total, &r.Archives); err != nil {
-			return Totals{}, err
-		}
-		r.PublishedAt, _ = time.Parse(time.RFC3339, created)
-		t.ByRelease = append(t.ByRelease, r)
-	}
-	if err := relRows.Err(); err != nil {
-		return Totals{}, err
+	for _, r := range releases {
+		t.ByRelease = append(t.ByRelease, *r)
 	}
 	sort.Slice(t.ByRelease, func(i, j int) bool {
-		return t.ByRelease[i].PublishedAt.After(t.ByRelease[j].PublishedAt)
+		a, b := t.ByRelease[i], t.ByRelease[j]
+		if !a.PublishedAt.Equal(b.PublishedAt) {
+			return a.PublishedAt.After(b.PublishedAt)
+		}
+		return a.Tag < b.Tag
 	})
 	return t, nil
 }
